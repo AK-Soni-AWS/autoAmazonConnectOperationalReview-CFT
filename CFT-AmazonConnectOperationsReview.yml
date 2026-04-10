@@ -11,6 +11,12 @@ Metadata:
           - AmazonConnectInstanceARN
           - AmazonConnectCloudWatchLogGroup
           - AmazonS3ForReports
+      - Label:
+          default: "AI Agent Monitoring Configuration (Optional)"
+        Parameters:
+          - AmazonConnectAssistantId
+          - AmazonConnectAssistantLogGroup
+          - EnableAIAgentChecks
     ParameterLabels:
       AmazonConnectInstanceARN:
         default: "Amazon Connnect Instance ARN"
@@ -18,6 +24,12 @@ Metadata:
         default: "Amazon Connect CloudWatch LogGroup"
       AmazonS3ForReports:
         default: "Amazon S3 bucket name"
+      AmazonConnectAssistantId:
+        default: "Q in Connect Assistant ID (optional)"
+      AmazonConnectAssistantLogGroup:
+        default: "AI Agent CloudWatch Log Group (optional)"
+      EnableAIAgentChecks:
+        default: "Enable AI Agent Checks"
         
 Parameters:
   AmazonConnectInstanceARN:
@@ -34,6 +46,24 @@ Parameters:
     MinLength: 3
     MaxLength: 63
     ConstraintDescription: 'Must be a valid S3 bucket name'
+
+  AmazonConnectAssistantId:
+    Type: String
+    Description: 'Q in Connect Assistant ID (leave blank to auto-discover from Connect instance). Example: 12345678-abcd-1234-efgh-123456789012'
+    Default: ''
+
+  AmazonConnectAssistantLogGroup:
+    Type: String
+    Description: 'CloudWatch Log Group for AI Agent event logs (optional - enables Phase 2 analytics checks). Example: /aws/wisdom/assistant/12345678-abcd-1234-efgh-123456789012'
+    Default: ''
+
+  EnableAIAgentChecks:
+    Type: String
+    Description: 'Enable AI Agent monitoring checks (requires Q in Connect / Amazon Connect AI Agents)'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
 
 Resources:
   # IAM Role for Lambda execution with required permissions
@@ -71,6 +101,61 @@ Resources:
             Effect: "Allow"
             Sid: "VisualEditor0"
         PolicyName: "PutObjectToS3-Review"
+      - PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Resource: "*"
+            Action:
+              - "qconnect:ListAssistants"
+              - "qconnect:GetAssistant"
+              - "qconnect:ListAIAgents"
+              - "qconnect:GetAIAgent"
+              - "qconnect:ListAIAgentVersions"
+              - "qconnect:ListAIPrompts"
+              - "qconnect:GetAIPrompt"
+              - "qconnect:ListAIGuardrails"
+              - "qconnect:GetAIGuardrail"
+              - "qconnect:ListAIPromptVersions"
+              - "qconnect:ListKnowledgeBases"
+              - "qconnect:GetKnowledgeBase"
+              - "qconnect:ListContents"
+              - "qconnect:ListAssistantAssociations"
+              - "wisdom:ListAssistants"
+              - "wisdom:GetAssistant"
+              - "wisdom:ListKnowledgeBases"
+              - "wisdom:GetKnowledgeBase"
+            Effect: "Allow"
+            Sid: "QConnectReadAccess"
+        PolicyName: "QConnectReadOnlyAccess"
+      - PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Resource: "*"
+            Action:
+              - "bedrock:ListGuardrails"
+              - "bedrock:GetGuardrail"
+              - "bedrock:ListInferenceProfiles"
+              - "bedrock:GetInferenceProfile"
+              - "bedrock:GetModelInvocationLoggingConfiguration"
+              - "bedrock:ListFoundationModels"
+            Effect: "Allow"
+            Sid: "BedrockReadAccess"
+        PolicyName: "BedrockReadOnlyAccess"
+      - PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Resource: "*"
+            Action:
+              - "logs:DescribeDeliveries"
+              - "logs:DescribeDeliverySources"
+              - "logs:DescribeDeliveryDestinations"
+              - "connect:ListIntegrationAssociations"
+              - "connect:ListInstanceStorageConfigs"
+              - "connect:ListSecurityProfiles"
+              - "connect:ListLambdaFunctions"
+            Effect: "Allow"
+            Sid: "AIAgentSupportAccess"
+        PolicyName: "AIAgentSupportReadOnlyAccess"
 
   # Lambda function with embedded code
   LambdaFunctionAmazonConnectOperationalReviewauto:
@@ -87,6 +172,9 @@ Resources:
           CONNECT_INSTANCE_ARN: !Ref AmazonConnectInstanceARN
           CONNECT_CW_LOG_GROUP: !Ref AmazonConnectCloudWatchLogGroup
           S3_REPORTING_BUCKET: !Ref AmazonS3ForReports
+          ASSISTANT_ID: !Ref AmazonConnectAssistantId
+          ASSISTANT_LOG_GROUP_NAME: !Ref AmazonConnectAssistantLogGroup
+          ENABLE_AI_CHECKS: !Ref EnableAIAgentChecks
       Code:
         ZipFile: |
           import boto3
@@ -133,6 +221,12 @@ Resources:
 
           # Initialize Service Quotas client
           service_quotas_client = boto3.client('service-quotas')
+
+          # Initialize Q in Connect client for AI Agent checks
+          qconnect_client = boto3.client('qconnect')
+
+          # Initialize Bedrock client for AI Agent checks
+          bedrock_client = boto3.client('bedrock')
 
           """Parse instance_id and aws_region from Amazon Connect instance ARN"""
           def parse_connect_instance_arn(instance_arn):
@@ -1409,6 +1503,681 @@ Resources:
               # If no SetLoggingBehavior block found or none are enabled
               return state
 
+
+          # ============================================================================
+          # AI AGENT CHECK FUNCTIONS - Phase 1 (13 Checks)
+          # ============================================================================
+
+          """Paginate any qconnect/bedrock list API safely"""
+          def paginate_api_call(client_method, result_key, **kwargs):
+              all_items = []
+              try:
+                  response = client_method(**kwargs)
+                  all_items.extend(response.get(result_key, []))
+                  while response.get('nextToken'):
+                      response = client_method(nextToken=response['nextToken'], **kwargs)
+                      all_items.extend(response.get(result_key, []))
+              except ClientError as e:
+                  logger.error(f"Pagination error for {result_key}: {e}")
+              return all_items
+
+          """Discover Assistant ID from Connect instance integration associations"""
+          def discover_assistant_id(instance_id):
+              try:
+                  response = connect_client.list_integration_associations(
+                      InstanceId=instance_id,
+                      IntegrationType='WISDOM_ASSISTANT'
+                  )
+                  associations = response.get('IntegrationAssociationSummaryList', [])
+                  if associations:
+                      assistant_arn = associations[0].get('IntegrationArn', '')
+                      assistant_id = assistant_arn.split('/')[-1] if '/' in assistant_arn else ''
+                      logger.info(f"Auto-discovered Assistant ID: {assistant_id}")
+                      return assistant_id
+                  logger.info("No WISDOM_ASSISTANT integration found for this instance.")
+                  return None
+              except Exception as e:
+                  logger.error(f"Error discovering Assistant ID: {e}")
+                  return None
+
+          """C1: AI Agent Inventory & Status"""
+          def check_ai_agent_inventory(assistant_id):
+              html = "<b>AI Agent Inventory</b><br>"
+              try:
+                  agents = paginate_api_call(qconnect_client.list_ai_agents, 'aiAgentSummaries', assistantId=assistant_id, maxResults=100)
+                  if not agents:
+                      html += "<br>No AI agents configured for this assistant."
+                      html += """<h4>Recommendation</h4><ul><li>Create self-service and/or agent-assist AI agents in the Connect AI agent designer.</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-agents.html" target="_blank">documentation</a>.</li></ul>"""
+                      return html
+
+                  html += f"<br>Found {len(agents)} AI agent(s).<br><br>"
+                  html += """<table style="width: 80%"><tr><th>Agent Name</th><th>Agent ID</th><th>Type</th><th>Status</th><th>Visibility</th></tr>"""
+                  for agent in agents:
+                      a_id = agent.get('aiAgentId', '')
+                      try:
+                          detail = qconnect_client.get_ai_agent(assistantId=assistant_id, aiAgentId=a_id)
+                          ai_agent = detail.get('aiAgent', {})
+                          name = escape(ai_agent.get('name', 'N/A'))
+                          a_type = escape(ai_agent.get('type', 'N/A'))
+                          status = escape(agent.get('status', 'N/A'))
+                          visibility = escape(ai_agent.get('visibilityStatus', 'N/A'))
+                      except Exception:
+                          name = escape(agent.get('name', 'N/A'))
+                          a_type = 'N/A'
+                          status = escape(agent.get('status', 'N/A'))
+                          visibility = 'N/A'
+                      html += f"<tr><td>{name}</td><td>{escape(a_id)}</td><td>{a_type}</td><td>{status}</td><td>{visibility}</td></tr>"
+                  html += "</table>"
+                  return html
+              except Exception as e:
+                  logger.error(f"C1 Error: {e}")
+                  return html + f"<br>Error retrieving AI agent inventory: {escape(str(e))}"
+
+          """C2: AI Prompt Configuration Review"""
+          def check_ai_prompt_configuration(assistant_id):
+              html = "<b>AI Prompt Configuration</b><br>"
+              try:
+                  prompts = paginate_api_call(qconnect_client.list_ai_prompts, 'aiPromptSummaries', assistantId=assistant_id, maxResults=100)
+                  if not prompts:
+                      html += "<br>No AI prompts configured."
+                      html += """<h4>Recommendation</h4><ul><li>Create AI prompts for self-service and agent-assist orchestration.</li></ul>"""
+                      return html
+
+                  html += f"<br>Found {len(prompts)} AI prompt(s).<br><br>"
+                  html += """<table style="width: 80%"><tr><th>Prompt Name</th><th>Type</th><th>Model ID</th><th>Visibility</th></tr>"""
+                  expensive_models = []
+                  EXPENSIVE_PATTERNS = ['claude-3-opus', 'claude-sonnet-4']
+                  for p in prompts:
+                      p_id = p.get('aiPromptId', '')
+                      try:
+                          detail = qconnect_client.get_ai_prompt(assistantId=assistant_id, aiPromptId=p_id)
+                          prompt = detail.get('aiPrompt', {})
+                          name = escape(prompt.get('name', 'N/A'))
+                          p_type = escape(prompt.get('type', 'N/A'))
+                          model_id = escape(prompt.get('modelId', 'N/A'))
+                          visibility = escape(prompt.get('visibilityStatus', 'N/A'))
+                      except Exception:
+                          name = escape(p.get('name', 'N/A'))
+                          p_type = 'N/A'
+                          model_id = 'N/A'
+                          visibility = 'N/A'
+                      if any(pat in model_id.lower() for pat in EXPENSIVE_PATTERNS):
+                          expensive_models.append(f"{name} ({model_id})")
+                      html += f"<tr><td>{name}</td><td>{p_type}</td><td>{model_id}</td><td>{visibility}</td></tr>"
+                  html += "</table>"
+                  if expensive_models:
+                      html += f"""<h4>Recommendation</h4><ul><li>Found {len(expensive_models)} prompt(s) using expensive models: {', '.join(expensive_models)}.</li>
+                          <li>Consider using Claude Haiku or Nova Lite for self-service orchestration to reduce cost.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"C2 Error: {e}")
+                  return html + f"<br>Error retrieving AI prompt configuration: {escape(str(e))}"
+
+          """S1: Q in Connect AI Guardrails"""
+          def check_q_guardrails(assistant_id):
+              html = "<b>Q in Connect AI Guardrails</b><br>"
+              try:
+                  guardrails = paginate_api_call(qconnect_client.list_ai_guardrails, 'aiGuardrailSummaries', assistantId=assistant_id, maxResults=100)
+                  published = [g for g in guardrails if g.get('visibilityStatus') == 'PUBLISHED']
+                  html += f"<br>Total guardrails: {len(guardrails)}, Published: {len(published)}<br>"
+                  if guardrails:
+                      html += """<br><table style="width: 60%"><tr><th>Guardrail Name</th><th>Status</th><th>Visibility</th></tr>"""
+                      for g in guardrails:
+                          html += f"<tr><td>{escape(g.get('name', 'N/A'))}</td><td>{escape(g.get('status', 'N/A'))}</td><td>{escape(g.get('visibilityStatus', 'N/A'))}</td></tr>"
+                      html += "</table>"
+                  if not published:
+                      html += """<br><span style="color: red; font-weight: bold;">CRITICAL: No published AI guardrails found. PII protection and content filtering are NOT active.</span>"""
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Deploy guardrails covering: (1) PII blocking for credit cards and SSNs, (2) denied topics for off-topic content, (3) contextual grounding with relevance threshold &ge;0.50.</li>
+                          <li>Maximum 3 custom guardrails per assistant.</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-guardrails.html" target="_blank">documentation</a>.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"S1 Error: {e}")
+                  return html + f"<br>Error checking guardrails: {escape(str(e))}"
+
+          """S2: Bedrock Guardrails Active"""
+          def check_bedrock_guardrails():
+              html = "<b>Bedrock Guardrails</b><br>"
+              try:
+                  response = bedrock_client.list_guardrails(maxResults=100)
+                  guardrails = response.get('guardrails', [])
+                  html += f"<br>Found {len(guardrails)} Bedrock guardrail(s) in this region.<br>"
+                  if guardrails:
+                      html += """<br><table style="width: 80%"><tr><th>Name</th><th>Guardrail ID</th><th>Status</th><th>Version</th></tr>"""
+                      for g in guardrails:
+                          html += f"<tr><td>{escape(g.get('name', 'N/A'))}</td><td>{escape(g.get('id', 'N/A'))}</td><td>{escape(g.get('status', 'N/A'))}</td><td>{escape(g.get('version', 'N/A'))}</td></tr>"
+                      html += "</table>"
+                  else:
+                      html += """<br><span style="color: red;">No Bedrock guardrails found in this region.</span>"""
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Create a dedicated Bedrock Guardrail for each Connect use case with content filters, PII filters, and denied topics.</li>
+                          <li>Monitor via CloudWatch namespace <code>AWS/Bedrock/Guardrails</code> - track <code>InvocationsIntervened</code>.</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html" target="_blank">documentation</a>.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"S2 Error: {e}")
+                  return html + f"<br>Error checking Bedrock guardrails: {escape(str(e))}"
+
+          """S4: Q in Connect Domain Encryption"""
+          def check_q_domain_encryption(assistant_id):
+              html = "<b>Q in Connect Domain Encryption</b><br>"
+              try:
+                  response = qconnect_client.get_assistant(assistantId=assistant_id)
+                  assistant = response.get('assistant', {})
+                  enc_config = assistant.get('serverSideEncryptionConfiguration', {})
+                  kms_key = enc_config.get('kmsKeyId', '')
+                  if kms_key:
+                      masked_key = kms_key[:40] + '...' if len(kms_key) > 40 else kms_key
+                      html += f"<br>Customer-managed KMS key configured: <code>{escape(masked_key)}</code>"
+                  else:
+                      html += "<br>Using AWS-owned encryption key (no customer-managed KMS key)."
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Configure a customer-managed KMS key for the Q in Connect domain to enable key rotation auditing and access control.</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/encryption-at-rest.html" target="_blank">documentation</a>.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"S4 Error: {e}")
+                  return html + f"<br>Error checking domain encryption: {escape(str(e))}"
+
+          """S5: Bedrock Model Invocation Logging"""
+          def check_bedrock_invocation_logging():
+              html = "<b>Bedrock Model Invocation Logging</b><br>"
+              try:
+                  response = bedrock_client.get_model_invocation_logging_configuration()
+                  config = response.get('loggingConfig', {})
+                  s3_config = config.get('s3Config', {})
+                  cw_config = config.get('cloudWatchConfig', {})
+                  s3_enabled = bool(s3_config.get('bucketName'))
+                  cw_enabled = bool(cw_config.get('logGroupName'))
+                  text_enabled = config.get('textDataDeliveryEnabled', False)
+                  image_enabled = config.get('imageDataDeliveryEnabled', False)
+
+                  html += f"""<br><table style="width: 50%">
+                      <tr><th>Setting</th><th>Value</th></tr>
+                      <tr><td>S3 Logging</td><td>{'Enabled - ' + escape(s3_config.get('bucketName', '')) if s3_enabled else 'Disabled'}</td></tr>
+                      <tr><td>CloudWatch Logging</td><td>{'Enabled - ' + escape(cw_config.get('logGroupName', '')) if cw_enabled else 'Disabled'}</td></tr>
+                      <tr><td>Text Data Delivery</td><td>{text_enabled}</td></tr>
+                      <tr><td>Image Data Delivery</td><td>{image_enabled}</td></tr>
+                      </table>"""
+                  if not s3_enabled and not cw_enabled:
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Enable model invocation logging for audit trail and compliance.</li>
+                          <li>CAUTION: If processing PII/sensitive data, ensure the logging destination has appropriate encryption and access controls.</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html" target="_blank">documentation</a>.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"S5 Error: {e}")
+                  return html + f"<br>Error checking invocation logging: {escape(str(e))}"
+
+          """P1: AI Agent Logging & Observability"""
+          def check_ai_agent_logging(assistant_id, account_id, aws_region):
+              html = "<b>AI Agent Logging &amp; Observability</b><br>"
+              try:
+                  assistant_arn = f"arn:aws:wisdom:{aws_region}:{account_id}:assistant/{assistant_id}"
+                  response = logs_client.describe_deliveries()
+                  deliveries = response.get('deliveries', [])
+                  matching = [d for d in deliveries if assistant_id in d.get('deliverySourceName', '')]
+                  if matching:
+                      html += f"<br>CloudWatch log delivery configured ({len(matching)} delivery/deliveries found).<br>"
+                      html += """<table style="width: 80%"><tr><th>Delivery ID</th><th>Source</th><th>Destination Type</th></tr>"""
+                      for d in matching:
+                          html += f"<tr><td>{escape(d.get('id', 'N/A'))}</td><td>{escape(d.get('deliverySourceName', 'N/A'))}</td><td>{escape(d.get('deliveryDestinationType', 'N/A'))}</td></tr>"
+                      html += "</table>"
+                  else:
+                      html += """<br><span style="color: red; font-weight: bold;">No CloudWatch log delivery configured for AI Agent events.</span>"""
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Enable AI Agent event logging via CloudWatch Vended Logs delivery for the assistant.</li>
+                          <li>This is required for analytics: tool usage, session analysis, LLM tracking, intent detection.</li>
+                          <li>Supported event types: TRANSCRIPT_AGENTIC_MESSAGE, TRANSCRIPT_SELF_SERVICE_MESSAGE, TRANSCRIPT_CREATE_SESSION, TRANSCRIPT_LARGE_LANGUAGE_MODEL_INVOCATION, TRANSCRIPT_RECOMMENDATION, and more.</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/monitor-ai-agents.html" target="_blank">documentation</a>.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"P1 Error: {e}")
+                  return html + f"<br>Error checking AI agent logging: {escape(str(e))}"
+
+          """Q2: Q in Connect Hard Limits"""
+          def check_q_hard_limits(assistant_id):
+              html = "<b>Q in Connect Service Limits</b><br>"
+              try:
+                  assistants = paginate_api_call(qconnect_client.list_assistants, 'assistantSummaries', maxResults=100)
+                  total_assistants = len(assistants)
+
+                  kb_associations = []
+                  try:
+                      assoc_resp = qconnect_client.list_assistant_associations(assistantId=assistant_id, maxResults=100)
+                      kb_associations = [a for a in assoc_resp.get('assistantAssociationSummaries', []) if a.get('associationType') == 'KNOWLEDGE_BASE']
+                  except Exception as e:
+                      logger.warning(f"Could not list assistant associations: {e}")
+
+                  html += """<br><table style="width: 50%">
+                      <tr><th>Resource</th><th>Current</th><th>Limit</th><th>Usage %</th></tr>"""
+                  # Assistants per account (limit 5, not adjustable)
+                  asst_pct = round(total_assistants / 5 * 100, 1)
+                  html += f'<tr><td>Assistants per account</td><td>{total_assistants}</td><td>5</td><td style="background-color: {get_color_by_percentage(asst_pct)};">{asst_pct}%</td></tr>'
+                  # KBs per assistant (limit 10)
+                  kb_count = len(kb_associations)
+                  kb_pct = round(kb_count / 10 * 100, 1)
+                  html += f'<tr><td>Knowledge Bases per assistant</td><td>{kb_count}</td><td>10</td><td style="background-color: {get_color_by_percentage(kb_pct)};">{kb_pct}%</td></tr>'
+                  # Assistant associations per instance (limit 1, not adjustable)
+                  html += f'<tr><td>Assistant per Connect instance</td><td>1</td><td>1</td><td style="background-color: {get_color_by_percentage(100)};">100%</td></tr>'
+                  html += "</table>"
+
+                  # Check article counts per KB
+                  if kb_associations:
+                      html += "<br><b>Knowledge Base Article Counts</b><br>"
+                      html += """<table style="width: 60%"><tr><th>Knowledge Base ID</th><th>Articles</th><th>Limit</th><th>Usage %</th></tr>"""
+                      for assoc in kb_associations:
+                          kb_id = assoc.get('associationData', {}).get('knowledgeBaseAssociation', {}).get('knowledgeBaseId', '')
+                          if kb_id:
+                              try:
+                                  contents = paginate_api_call(qconnect_client.list_contents, 'contentSummaries', knowledgeBaseId=kb_id, maxResults=100)
+                                  article_count = len(contents)
+                                  art_pct = round(article_count / 5000 * 100, 1)
+                                  html += f'<tr><td>{escape(kb_id)}</td><td>{article_count}</td><td>5000</td><td style="background-color: {get_color_by_percentage(art_pct)};">{art_pct}%</td></tr>'
+                              except Exception:
+                                  html += f'<tr><td>{escape(kb_id)}</td><td>N/A</td><td>5000</td><td>N/A</td></tr>'
+                      html += "</table>"
+
+                  html += """<h4>Key Constraints</h4><ul>
+                      <li>1 assistant association per Connect instance (not adjustable) - plan architecture accordingly.</li>
+                      <li>5,000 articles per knowledge base (not adjustable) - prioritize by relevance, retire stale content.</li>
+                      <li>5 GB maximum knowledge base size (not adjustable).</li>
+                      <li>SendMessage API: 1-2 TPS depending on region.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"Q2 Error: {e}")
+                  return html + f"<br>Error checking Q in Connect limits: {escape(str(e))}"
+
+          """R2: Cross-Region Inference Profiles"""
+          def check_cross_region_inference():
+              html = "<b>Bedrock Cross-Region Inference Profiles</b><br>"
+              try:
+                  response = bedrock_client.list_inference_profiles(maxResults=100)
+                  profiles = response.get('inferenceProfileSummaries', [])
+                  cross_region_prefixes = ['us.', 'eu.', 'ap.', 'global.']
+                  cross_region = [p for p in profiles if any(p.get('inferenceProfileName', '').startswith(pfx) for pfx in cross_region_prefixes)]
+                  single_region = [p for p in profiles if p not in cross_region]
+
+                  html += f"<br>Total inference profiles: {len(profiles)} (Cross-region: {len(cross_region)}, Single-region: {len(single_region)})<br>"
+                  if cross_region:
+                      html += """<br><table style="width: 80%"><tr><th>Profile Name</th><th>Profile ID</th><th>Type</th><th>Status</th></tr>"""
+                      for p in cross_region[:20]:
+                          html += f"<tr><td>{escape(p.get('inferenceProfileName', 'N/A'))}</td><td>{escape(p.get('inferenceProfileId', 'N/A'))}</td><td>{escape(p.get('type', 'N/A'))}</td><td>{escape(p.get('status', 'N/A'))}</td></tr>"
+                      html += "</table>"
+                  if not cross_region:
+                      html += """<br><span style="color: orange;">No cross-region inference profiles detected.</span>"""
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Use geographic cross-region inference profiles (us.*, eu.*) for resilience and up to 2x effective quota.</li>
+                          <li>For data residency requirements, use geographic profiles (not global.*).</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html" target="_blank">documentation</a>.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"R2 Error: {e}")
+                  return html + f"<br>Error checking inference profiles: {escape(str(e))}"
+
+          """R3: Knowledge Base Association & Sync Health"""
+          def check_kb_sync_health(assistant_id):
+              html = "<b>Knowledge Base Sync Health</b><br>"
+              try:
+                  assoc_resp = qconnect_client.list_assistant_associations(assistantId=assistant_id, maxResults=100)
+                  kb_associations = [a for a in assoc_resp.get('assistantAssociationSummaries', []) if a.get('associationType') == 'KNOWLEDGE_BASE']
+
+                  if not kb_associations:
+                      html += "<br>No knowledge bases associated with this assistant."
+                      html += """<h4>Recommendation</h4><ul><li>Associate at least one knowledge base with the assistant for AI agent retrieval capabilities.</li></ul>"""
+                      return html
+
+                  html += f"<br>Found {len(kb_associations)} knowledge base association(s).<br><br>"
+                  html += """<table style="width: 80%"><tr><th>KB Name</th><th>KB ID</th><th>Status</th><th>Last Content Modified</th><th>Hours Since Sync</th><th>Health</th></tr>"""
+                  stale_kbs = []
+                  for assoc in kb_associations:
+                      kb_id = assoc.get('associationData', {}).get('knowledgeBaseAssociation', {}).get('knowledgeBaseId', '')
+                      if not kb_id:
+                          continue
+                      try:
+                          kb_resp = qconnect_client.get_knowledge_base(knowledgeBaseId=kb_id)
+                          kb = kb_resp.get('knowledgeBase', {})
+                          kb_name = escape(kb.get('name', 'N/A'))
+                          kb_status = escape(kb.get('status', 'N/A'))
+                          last_modified = kb.get('lastContentModificationTime')
+                          if last_modified:
+                              hours_since = (datetime.now(timezone.utc) - last_modified).total_seconds() / 3600
+                              hours_str = f"{hours_since:.1f}"
+                              health = "STALE" if hours_since > 24 else "HEALTHY"
+                              if hours_since > 24:
+                                  stale_kbs.append(kb_name)
+                              color = "#FF0000" if hours_since > 24 else "#00FF00"
+                              last_mod_str = last_modified.strftime("%Y-%m-%d %H:%M UTC")
+                          else:
+                              hours_str = "Unknown"
+                              health = "UNKNOWN"
+                              color = "#FFA500"
+                              last_mod_str = "Never"
+                          html += f'<tr><td>{kb_name}</td><td>{escape(kb_id)}</td><td>{kb_status}</td><td>{last_mod_str}</td><td>{hours_str}</td><td style="background-color: {color};">{health}</td></tr>'
+                      except Exception as kb_err:
+                          html += f'<tr><td>N/A</td><td>{escape(kb_id)}</td><td>ERROR</td><td>N/A</td><td>N/A</td><td style="background-color: #FFA500;">ERROR</td></tr>'
+                          logger.warning(f"Error getting KB {kb_id}: {kb_err}")
+                  html += "</table>"
+                  if stale_kbs:
+                      html += f"""<h4>Recommendation</h4><ul>
+                          <li>Knowledge base(s) with stale data (&gt;24h since last sync): {', '.join(stale_kbs)}</li>
+                          <li>Check sync configuration (default: 1 hour). For S3 sources, verify S3 event triggers.</li>
+                          <li>Set CloudWatch alarm on <code>RecordsFailed &gt; 0</code> in <code>AWS/AppIntegrations</code> namespace.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"R3 Error: {e}")
+                  return html + f"<br>Error checking KB sync health: {escape(str(e))}"
+
+          """P6: Bedrock Invocation Latency"""
+          def check_bedrock_latency(days_back):
+              html = "<b>Bedrock Model Invocation Latency</b><br>"
+              try:
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(days=days_back)
+                  metrics_resp = cloudwatch_client.list_metrics(Namespace='AWS/Bedrock', MetricName='InvocationLatency')
+                  model_metrics = metrics_resp.get('Metrics', [])
+                  if not model_metrics:
+                      html += "<br>No Bedrock invocation latency data found for this period."
+                      return html
+
+                  html += f"<br>Analyzing latency for {len(model_metrics)} model dimension(s) over last {days_back} days.<br><br>"
+                  html += """<table style="width: 70%"><tr><th>Model ID</th><th>Avg Latency (ms)</th><th>Max Latency (ms)</th><th>Status</th></tr>"""
+                  for metric in model_metrics[:15]:
+                      dims = {d['Name']: d['Value'] for d in metric.get('Dimensions', [])}
+                      model_id = dims.get('ModelId', 'Unknown')
+                      try:
+                          stats = cloudwatch_client.get_metric_statistics(
+                              Namespace='AWS/Bedrock', MetricName='InvocationLatency',
+                              Dimensions=metric['Dimensions'], StartTime=start_time, EndTime=end_time,
+                              Period=86400, Statistics=['Average', 'Maximum'])
+                          dps = stats.get('Datapoints', [])
+                          if dps:
+                              avg_lat = round(sum(d['Average'] for d in dps) / len(dps), 0)
+                              max_lat = round(max(d['Maximum'] for d in dps), 0)
+                              status = "CRITICAL" if max_lat > 7000 else "WARNING" if max_lat > 5000 else "OK"
+                              color = "#FF0000" if status == "CRITICAL" else "#FFA500" if status == "WARNING" else "#00FF00"
+                          else:
+                              avg_lat = 'N/A'
+                              max_lat = 'N/A'
+                              status = 'NO DATA'
+                              color = '#CCCCCC'
+                      except Exception:
+                          avg_lat = 'Error'
+                          max_lat = 'Error'
+                          status = 'ERROR'
+                          color = '#FFA500'
+                      html += f'<tr><td>{escape(model_id)}</td><td>{avg_lat}</td><td>{max_lat}</td><td style="background-color: {color};">{status}</td></tr>'
+                  html += "</table>"
+                  html += """<h4>Guidance</h4><ul>
+                      <li>Connect synchronous Lambda timeout is 8 seconds. Target model p99 latency &lt;5000ms.</li>
+                      <li>If latency exceeds limits, switch to a faster model (Haiku/Nova Lite) or reduce <code>max_tokens</code>.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"P6 Error: {e}")
+                  return html + f"<br>Error checking Bedrock latency: {escape(str(e))}"
+
+          """P7: Bedrock Throttling Rate"""
+          def check_bedrock_throttling(days_back):
+              html = "<b>Bedrock Invocation Throttling</b><br>"
+              try:
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(days=days_back)
+                  metrics_resp = cloudwatch_client.list_metrics(Namespace='AWS/Bedrock', MetricName='InvocationThrottles')
+                  model_metrics = metrics_resp.get('Metrics', [])
+                  if not model_metrics:
+                      html += "<br>No Bedrock throttling metrics found. This indicates no throttling has occurred or no Bedrock usage in this region."
+                      return html
+
+                  html += f"<br>Checking throttling for {len(model_metrics)} model dimension(s) over last {days_back} days.<br><br>"
+                  html += """<table style="width: 60%"><tr><th>Model ID</th><th>Total Throttles</th><th>Status</th></tr>"""
+                  total_throttles = 0
+                  for metric in model_metrics[:15]:
+                      dims = {d['Name']: d['Value'] for d in metric.get('Dimensions', [])}
+                      model_id = dims.get('ModelId', 'Unknown')
+                      try:
+                          stats = cloudwatch_client.get_metric_statistics(
+                              Namespace='AWS/Bedrock', MetricName='InvocationThrottles',
+                              Dimensions=metric['Dimensions'], StartTime=start_time, EndTime=end_time,
+                              Period=86400, Statistics=['Sum'])
+                          dps = stats.get('Datapoints', [])
+                          throttles = int(sum(d.get('Sum', 0) for d in dps))
+                          total_throttles += throttles
+                          status = "CRITICAL" if throttles >= 10 else "WARNING" if throttles > 0 else "OK"
+                          color = "#FF0000" if status == "CRITICAL" else "#FFA500" if status == "WARNING" else "#00FF00"
+                      except Exception:
+                          throttles = 'Error'
+                          status = 'ERROR'
+                          color = '#FFA500'
+                      html += f'<tr><td>{escape(model_id)}</td><td>{throttles}</td><td style="background-color: {color};">{status}</td></tr>'
+                  html += "</table>"
+                  if total_throttles > 0:
+                      html += f"""<h4>Recommendation</h4><ul>
+                          <li>{total_throttles} total throttle(s) detected. Request TPM quota increase via AWS Support.</li>
+                          <li>Use cross-region inference profiles for up to 2x effective quota.</li>
+                          <li>Implement exponential backoff with jitter in retry logic.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"P7 Error: {e}")
+                  return html + f"<br>Error checking Bedrock throttling: {escape(str(e))}"
+
+          """P8: Connect Contact Flow Errors"""
+          def check_flow_errors(instance_id, days_back):
+              html = "<b>Contact Flow Errors &amp; Fatal Errors</b><br>"
+              try:
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(days=days_back)
+                  # Check ContactFlowFatalErrors
+                  fatal_resp = cloudwatch_client.get_metric_statistics(
+                      Namespace='AWS/Connect', MetricName='ContactFlowFatalErrors',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                      StartTime=start_time, EndTime=end_time, Period=86400, Statistics=['Sum'])
+                  fatal_dps = fatal_resp.get('Datapoints', [])
+                  total_fatal = int(sum(d.get('Sum', 0) for d in fatal_dps))
+
+                  # Check ContactFlowErrors
+                  error_resp = cloudwatch_client.get_metric_statistics(
+                      Namespace='AWS/Connect', MetricName='ContactFlowErrors',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                      StartTime=start_time, EndTime=end_time, Period=86400, Statistics=['Sum'])
+                  error_dps = error_resp.get('Datapoints', [])
+                  total_errors = int(sum(d.get('Sum', 0) for d in error_dps))
+
+                  fatal_color = "#FF0000" if total_fatal > 0 else "#00FF00"
+                  error_color = "#FF0000" if total_errors > 50 else "#FFA500" if total_errors > 0 else "#00FF00"
+
+                  html += f"""<br><table style="width: 50%">
+                      <tr><th>Metric</th><th>Count ({days_back} days)</th><th>Status</th></tr>
+                      <tr><td>Contact Flow Fatal Errors</td><td>{total_fatal}</td><td style="background-color: {fatal_color};">{'CRITICAL' if total_fatal > 0 else 'OK'}</td></tr>
+                      <tr><td>Contact Flow Errors</td><td>{total_errors}</td><td style="background-color: {error_color};">{'CRITICAL' if total_errors > 50 else 'WARNING' if total_errors > 0 else 'OK'}</td></tr>
+                      </table>"""
+                  if total_fatal > 0 or total_errors > 50:
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Fatal errors indicate flow execution failures - check Lambda timeouts, Bedrock throttling, and missing error branches.</li>
+                          <li>Correlate with Bedrock latency (P6) and throttling (P7) findings for root cause.</li>
+                          <li>Set CloudWatch alarm: <code>ContactFlowFatalErrors &gt; 0</code> for any 5-minute window.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"P8 Error: {e}")
+                  return html + f"<br>Error checking flow errors: {escape(str(e))}"
+
+          """Phase 2: AI Agent Log Analytics Checks (P2-P5, P10, P11, C3, C5)"""
+          def run_ai_log_insights_query(log_group, query_string, hours_back=336):
+              try:
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=hours_back)
+                  response = logs_client.start_query(
+                      logGroupName=log_group,
+                      startTime=int(start_time.timestamp()),
+                      endTime=int(end_time.timestamp()),
+                      queryString=query_string)
+                  query_id = response['queryId']
+                  max_attempts = 20
+                  for attempt in range(max_attempts):
+                      time.sleep(2)
+                      result = logs_client.get_query_results(queryId=query_id)
+                      if result['status'] == 'Complete':
+                          return result['results']
+                      elif result['status'] == 'Failed':
+                          logger.error(f"Log Insights query failed")
+                          return []
+                  logger.warning("Log Insights query timed out")
+                  return []
+              except Exception as e:
+                  logger.error(f"Log Insights query error: {e}")
+                  return []
+
+          """P2: AI Agent Event Distribution"""
+          def check_ai_event_distribution(log_group):
+              html = "<b>AI Agent Event Distribution</b><br>"
+              try:
+                  query = "fields event_type | stats count() as cnt by event_type | sort cnt desc"
+                  results = run_ai_log_insights_query(log_group, query)
+                  if not results:
+                      html += "<br>No AI agent events found in the log group for this period."
+                      return html
+                  html += """<br><table style="width: 60%"><tr><th>Event Type</th><th>Count</th></tr>"""
+                  for row in results:
+                      fields = {f['field']: f['value'] for f in row}
+                      html += f"<tr><td>{escape(fields.get('event_type', 'N/A'))}</td><td>{escape(fields.get('cnt', '0'))}</td></tr>"
+                  html += "</table>"
+                  return html
+              except Exception as e:
+                  logger.error(f"P2 Error: {e}")
+                  return html + f"<br>Error: {escape(str(e))}"
+
+          """P3: Tool Usage Analysis & Escalation Rate"""
+          def check_tool_usage(log_group):
+              html = "<b>AI Agent Tool Usage &amp; Escalation Rate</b><br>"
+              try:
+                  query = """fields @timestamp, completion
+                      | filter event_type = 'TRANSCRIPT_SELF_SERVICE_MESSAGE' and ispresent(completion)
+                      | filter completion like /toolUse/
+                      | parse completion /"name":"(?<tool_name>[^"]+)"/
+                      | stats count() as cnt by tool_name
+                      | sort cnt desc"""
+                  results = run_ai_log_insights_query(log_group, query)
+                  if not results:
+                      html += "<br>No tool usage data found."
+                      return html
+                  tool_counts = {}
+                  for row in results:
+                      fields = {f['field']: f['value'] for f in row}
+                      tool_counts[fields.get('tool_name', 'Unknown')] = int(fields.get('cnt', 0))
+                  total = sum(tool_counts.values())
+                  escalations = tool_counts.get('Escalation', 0) + tool_counts.get('ESCALATION', 0) + tool_counts.get('escalation', 0)
+                  esc_rate = round(escalations / total * 100, 1) if total > 0 else 0
+                  esc_color = "#FF0000" if esc_rate > 40 else "#FFA500" if esc_rate > 20 else "#00FF00"
+
+                  html += f"<br>Total tool invocations: {total} | Escalation rate: <span style='background-color: {esc_color};'>{esc_rate}%</span><br><br>"
+                  html += """<table style="width: 50%"><tr><th>Tool</th><th>Count</th><th>%</th></tr>"""
+                  for tool, cnt in sorted(tool_counts.items(), key=lambda x: x[1], reverse=True):
+                      pct = round(cnt / total * 100, 1) if total > 0 else 0
+                      html += f"<tr><td>{escape(tool)}</td><td>{cnt}</td><td>{pct}%</td></tr>"
+                  html += "</table>"
+                  if esc_rate > 20:
+                      html += f"""<h4>Recommendation</h4><ul><li>Escalation rate is {esc_rate}% (target &lt;20%). Review AI agent prompts and knowledge base content to improve self-service resolution.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"P3 Error: {e}")
+                  return html + f"<br>Error: {escape(str(e))}"
+
+          """P4: LLM Model Usage"""
+          def check_llm_model_usage(log_group):
+              html = "<b>LLM Model Usage from AI Agent Logs</b><br>"
+              try:
+                  query = "filter event_type = 'TRANSCRIPT_LARGE_LANGUAGE_MODEL_INVOCATION' | stats count(*) as invocations by model_id | sort invocations desc"
+                  results = run_ai_log_insights_query(log_group, query)
+                  if not results:
+                      html += "<br>No LLM invocation data found."
+                      return html
+                  html += """<br><table style="width: 60%"><tr><th>Model ID</th><th>Invocations</th></tr>"""
+                  for row in results:
+                      fields = {f['field']: f['value'] for f in row}
+                      html += f"<tr><td>{escape(fields.get('model_id', 'N/A'))}</td><td>{escape(fields.get('invocations', '0'))}</td></tr>"
+                  html += "</table>"
+                  return html
+              except Exception as e:
+                  logger.error(f"P4 Error: {e}")
+                  return html + f"<br>Error: {escape(str(e))}"
+
+          """P5: Session Analytics"""
+          def check_session_analytics(log_group):
+              html = "<b>AI Agent Session Analytics</b><br>"
+              try:
+                  session_query = "filter event_type = 'TRANSCRIPT_CREATE_SESSION' | stats count() as total_sessions"
+                  session_results = run_ai_log_insights_query(log_group, session_query)
+                  total_sessions = 0
+                  if session_results:
+                      fields = {f['field']: f['value'] for f in session_results[0]}
+                      total_sessions = int(fields.get('total_sessions', 0))
+                  html += f"<br>Total sessions created: {total_sessions}<br>"
+
+                  loop_query = "filter event_type = 'TRANSCRIPT_AGENTIC_MESSAGE' | stats count(*) as steps by session_id | sort steps desc | limit 10"
+                  loop_results = run_ai_log_insights_query(log_group, loop_query)
+                  if loop_results:
+                      html += "<br><b>Top Sessions by Agentic Loop Iterations</b><br>"
+                      html += """<table style="width: 60%"><tr><th>Session ID</th><th>Iterations</th><th>Status</th></tr>"""
+                      for row in loop_results:
+                          fields = {f['field']: f['value'] for f in row}
+                          steps = int(fields.get('steps', 0))
+                          status = "WARNING" if steps > 10 else "OK"
+                          color = "#FFA500" if steps > 10 else "#00FF00"
+                          html += f'<tr><td>{escape(fields.get("session_id", "N/A"))}</td><td>{steps}</td><td style="background-color: {color};">{status}</td></tr>'
+                      html += "</table>"
+                      if any(int({f['field']: f['value'] for f in r}.get('steps', 0)) > 10 for r in loop_results):
+                          html += """<h4>Recommendation</h4><ul><li>Sessions with &gt;10 agentic iterations may indicate infinite loops or poorly configured orchestration. Review agent prompts.</li></ul>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"P5 Error: {e}")
+                  return html + f"<br>Error: {escape(str(e))}"
+
+          """P10: Recommendation Effectiveness"""
+          def check_recommendation_effectiveness(log_group):
+              html = "<b>AI Agent Recommendation Effectiveness</b><br>"
+              try:
+                  rec_query = "filter event_type = 'TRANSCRIPT_RECOMMENDATION' | stats count() as total_recs"
+                  rec_results = run_ai_log_insights_query(log_group, rec_query)
+                  total_recs = 0
+                  if rec_results:
+                      fields = {f['field']: f['value'] for f in rec_results[0]}
+                      total_recs = int(fields.get('total_recs', 0))
+
+                  feedback_query = "filter event_type = 'TRANSCRIPT_RESULT_FEEDBACK' | stats count() as cnt by is_recommendation_useful | sort cnt desc"
+                  feedback_results = run_ai_log_insights_query(log_group, feedback_query)
+                  html += f"<br>Total recommendations delivered: {total_recs}<br>"
+                  if feedback_results:
+                      html += """<br><table style="width: 50%"><tr><th>Useful?</th><th>Count</th></tr>"""
+                      for row in feedback_results:
+                          fields = {f['field']: f['value'] for f in row}
+                          html += f"<tr><td>{escape(fields.get('is_recommendation_useful', 'N/A'))}</td><td>{escape(fields.get('cnt', '0'))}</td></tr>"
+                      html += "</table>"
+                  else:
+                      html += "<br>No recommendation feedback data found."
+                  return html
+              except Exception as e:
+                  logger.error(f"P10 Error: {e}")
+                  return html + f"<br>Error: {escape(str(e))}"
+
+          """P11: Intent Detection Analysis"""
+          def check_intent_detection(log_group):
+              html = "<b>AI Agent Intent Detection</b><br>"
+              try:
+                  query = "filter event_type = 'TRANSCRIPT_INTENT_TRIGGERING_REFERENCE' | stats count() as cnt by intent | sort cnt desc | limit 20"
+                  results = run_ai_log_insights_query(log_group, query)
+                  if not results:
+                      html += "<br>No intent detection data found."
+                      return html
+                  html += """<br><table style="width: 60%"><tr><th>Intent</th><th>Trigger Count</th></tr>"""
+                  for row in results:
+                      fields = {f['field']: f['value'] for f in row}
+                      html += f"<tr><td>{escape(fields.get('intent', 'N/A'))}</td><td>{escape(fields.get('cnt', '0'))}</td></tr>"
+                  html += "</table>"
+                  return html
+              except Exception as e:
+                  logger.error(f"P11 Error: {e}")
+                  return html + f"<br>Error: {escape(str(e))}"
           """Main Handler"""
           def lambda_handler(event, context):
               try:
@@ -1758,6 +2527,188 @@ Resources:
                   get_connect_metric_simple(instance_id, 'MissedCalls', days_back)
                   get_connect_metric_simple(instance_id, 'QueueSize', days_back)
 
+
+
+                  # ============================================================================
+                  # AI AGENT CHECKS - Phase 1 & Phase 2
+                  # ============================================================================
+                  enable_ai_checks = os.environ.get('ENABLE_AI_CHECKS', 'true').lower() == 'true'
+                  assistant_id = os.environ.get('ASSISTANT_ID', '').strip()
+                  assistant_log_group = os.environ.get('ASSISTANT_LOG_GROUP_NAME', '').strip()
+
+                  if enable_ai_checks:
+                      logger.info("Starting AI Agent checks...")
+                      lambda_exec_intermediate_time = time.time()
+
+                      # Auto-discover assistant ID if not provided
+                      if not assistant_id:
+                          assistant_id = discover_assistant_id(instance_id)
+
+                      if assistant_id:
+                          logger.info(f"Running AI checks for Assistant ID: {assistant_id}")
+
+                          html_output += """<h2>AI Agent Overview</h2>
+                              <p>Amazon Connect AI Agents (Q in Connect) provide AI-powered self-service and agent-assist capabilities.
+                              The following checks assess the configuration, security, performance, and operational health of your AI agent deployment.</p>"""
+
+                          # --- C1: AI Agent Inventory ---
+                          html_output += '<div class="section"><h3>C1: AI Agent Inventory &amp; Status</h3>'
+                          html_output += check_ai_agent_inventory(assistant_id)
+                          html_output += '</div>'
+                          logger.info(f"C1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- C2: AI Prompt Configuration ---
+                          html_output += '<div class="section"><h3>C2: AI Prompt Configuration Review</h3>'
+                          html_output += check_ai_prompt_configuration(assistant_id)
+                          html_output += '</div>'
+                          logger.info(f"C2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- Security Checks ---
+                          html_output += """<h2>AI Agent Security</h2>"""
+
+                          # --- S1: Q Guardrails ---
+                          html_output += '<div class="section"><h3>S1: Q in Connect AI Guardrails</h3>'
+                          html_output += check_q_guardrails(assistant_id)
+                          html_output += '</div>'
+                          logger.info(f"S1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- S2: Bedrock Guardrails ---
+                          html_output += '<div class="section"><h3>S2: Bedrock Guardrails</h3>'
+                          html_output += check_bedrock_guardrails()
+                          html_output += '</div>'
+                          logger.info(f"S2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- S4: Domain Encryption ---
+                          html_output += '<div class="section"><h3>S4: Q in Connect Domain Encryption</h3>'
+                          html_output += check_q_domain_encryption(assistant_id)
+                          html_output += '</div>'
+                          logger.info(f"S4 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- S5: Bedrock Invocation Logging ---
+                          html_output += '<div class="section"><h3>S5: Bedrock Model Invocation Logging</h3>'
+                          html_output += check_bedrock_invocation_logging()
+                          html_output += '</div>'
+                          logger.info(f"S5 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- Performance Checks ---
+                          html_output += """<h2>AI Agent Performance</h2>"""
+
+                          # --- P1: AI Agent Logging ---
+                          html_output += '<div class="section"><h3>P1: AI Agent Logging &amp; Observability</h3>'
+                          html_output += check_ai_agent_logging(assistant_id, account_id, aws_region)
+                          html_output += '</div>'
+                          logger.info(f"P1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- P6: Bedrock Latency ---
+                          html_output += '<div class="section"><h3>P6: Bedrock Invocation Latency</h3>'
+                          html_output += check_bedrock_latency(days_back)
+                          html_output += '</div>'
+                          logger.info(f"P6 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- P7: Bedrock Throttling ---
+                          html_output += '<div class="section"><h3>P7: Bedrock Invocation Throttling</h3>'
+                          html_output += check_bedrock_throttling(days_back)
+                          html_output += '</div>'
+                          logger.info(f"P7 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- P8: Flow Errors ---
+                          html_output += '<div class="section"><h3>P8: Contact Flow Errors</h3>'
+                          html_output += check_flow_errors(instance_id, days_back)
+                          html_output += '</div>'
+                          logger.info(f"P8 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- Resilience Checks ---
+                          html_output += """<h2>AI Agent Resilience</h2>"""
+
+                          # --- R2: Cross-Region Inference ---
+                          html_output += '<div class="section"><h3>R2: Cross-Region Inference Profiles</h3>'
+                          html_output += check_cross_region_inference()
+                          html_output += '</div>'
+                          logger.info(f"R2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- R3: KB Sync Health ---
+                          html_output += '<div class="section"><h3>R3: Knowledge Base Sync Health</h3>'
+                          html_output += check_kb_sync_health(assistant_id)
+                          html_output += '</div>'
+                          logger.info(f"R3 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # --- Service Quotas ---
+                          html_output += """<h2>AI Agent Service Quotas</h2>"""
+
+                          # --- Q2: Q Hard Limits ---
+                          html_output += '<div class="section"><h3>Q2: Q in Connect Service Limits</h3>'
+                          html_output += check_q_hard_limits(assistant_id)
+                          html_output += '</div>'
+                          logger.info(f"Q2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
+                          # ============================================================
+                          # Phase 2: Log Analytics (only if log group is configured)
+                          # ============================================================
+                          if assistant_log_group:
+                              logger.info(f"Phase 2: Log analytics with log group: {assistant_log_group}")
+                              html_output += """<h2>AI Agent Analytics (Log-Based)</h2>
+                                  <p>Analyzing AI Agent event logs from CloudWatch for operational insights.</p>"""
+
+                              html_output += '<div class="section"><h3>P2: Event Distribution</h3>'
+                              html_output += check_ai_event_distribution(assistant_log_group)
+                              html_output += '</div>'
+                              logger.info(f"P2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                              lambda_exec_intermediate_time = time.time()
+
+                              html_output += '<div class="section"><h3>P3: Tool Usage &amp; Escalation Rate</h3>'
+                              html_output += check_tool_usage(assistant_log_group)
+                              html_output += '</div>'
+                              logger.info(f"P3 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                              lambda_exec_intermediate_time = time.time()
+
+                              html_output += '<div class="section"><h3>P4: LLM Model Usage</h3>'
+                              html_output += check_llm_model_usage(assistant_log_group)
+                              html_output += '</div>'
+                              logger.info(f"P4 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                              lambda_exec_intermediate_time = time.time()
+
+                              html_output += '<div class="section"><h3>P5: Session Analytics</h3>'
+                              html_output += check_session_analytics(assistant_log_group)
+                              html_output += '</div>'
+                              logger.info(f"P5 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                              lambda_exec_intermediate_time = time.time()
+
+                              html_output += '<div class="section"><h3>P10: Recommendation Effectiveness</h3>'
+                              html_output += check_recommendation_effectiveness(assistant_log_group)
+                              html_output += '</div>'
+                              logger.info(f"P10 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                              lambda_exec_intermediate_time = time.time()
+
+                              html_output += '<div class="section"><h3>P11: Intent Detection</h3>'
+                              html_output += check_intent_detection(assistant_log_group)
+                              html_output += '</div>'
+                              logger.info(f"P11 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                              lambda_exec_intermediate_time = time.time()
+                          else:
+                              html_output += """<h2>AI Agent Analytics (Log-Based)</h2>
+                                  <p>Phase 2 log analytics checks are disabled. Set <code>ASSISTANT_LOG_GROUP_NAME</code> env var to enable.</p>"""
+
+                          logger.info("AI Agent checks completed.")
+                      else:
+                          html_output += """<h2>AI Agent Checks</h2>
+                              <p>No Q in Connect assistant found. AI Agent checks skipped.
+                              Associate a Q in Connect assistant or set <code>ASSISTANT_ID</code> env var.</p>"""
+                          logger.info("No assistant ID. AI checks skipped.")
+                  else:
+                      logger.info("AI Agent checks disabled (ENABLE_AI_CHECKS=false)")
 
                   # Get Date timestamp
                   now_utc = datetime.now(timezone.utc)
