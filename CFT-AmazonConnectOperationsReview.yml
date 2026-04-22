@@ -165,6 +165,7 @@ Resources:
       Code:
         ZipFile: |
           import boto3
+          import boto3
           import json
           import logging
           import os
@@ -1632,19 +1633,132 @@ Resources:
               html = "<b>Q in Connect AI Guardrails</b><br>"
               logger.info(f"[S1] Starting Q Guardrails check for assistant_id={assistant_id}")
               try:
+                  # --- Part 1: List and analyze guardrail configurations ---
                   guardrails = paginate_api_call(qconnect_client.list_ai_guardrails, 'aiGuardrailSummaries', assistantId=assistant_id, maxResults=100)
                   logger.info(f"[S1] list_ai_guardrails returned {len(guardrails)} guardrail(s)")
                   published = [g for g in guardrails if g.get('visibilityStatus') == 'PUBLISHED']
                   html += f"<br>Total guardrails: {len(guardrails)}, Published: {len(published)}<br>"
-                  if guardrails:
-                      html += """<br><table style="width: 60%"><tr><th>Guardrail Name</th><th>Status</th><th>Visibility</th></tr>"""
-                      for g in guardrails:
-                          html += f"<tr><td>{escape(g.get('name', 'N/A'))}</td><td>{escape(g.get('status', 'N/A'))}</td><td>{escape(g.get('visibilityStatus', 'N/A'))}</td></tr>"
+          
+                  # Get detailed config for each guardrail to check filter coverage
+                  guardrail_details = []
+                  for g in guardrails:
+                      g_id = g.get('aiGuardrailId', '')
+                      detail = {}
+                      try:
+                          resp = qconnect_client.get_ai_guardrail(assistantId=assistant_id, aiGuardrailId=g_id)
+                          detail = resp.get('aiGuardrail', {})
+                          logger.info(f"[S1] Guardrail '{g.get('name')}' detail keys: {list(detail.keys())}")
+                      except Exception as gd_err:
+                          logger.warning(f"[S1] Could not get detail for guardrail {g_id}: {gd_err}")
+          
+                      # Check which filter types are configured
+                      has_content_filter = bool(detail.get('contentPolicyConfig', {}).get('filtersConfig', []))
+                      has_topic_policy = bool(detail.get('topicPolicyConfig', {}).get('topicsConfig', []))
+                      has_pii_filter = bool(detail.get('sensitiveInformationPolicyConfig', {}).get('piiEntitiesConfig', []) or
+                                            detail.get('sensitiveInformationPolicyConfig', {}).get('regexesConfig', []))
+                      has_word_filter = bool(detail.get('wordPolicyConfig', {}).get('wordsConfig', []) or
+                                            detail.get('wordPolicyConfig', {}).get('managedWordListsConfig', []))
+                      has_grounding = bool(detail.get('contextualGroundingPolicyConfig', {}).get('filtersConfig', []))
+          
+                      guardrail_details.append({
+                          'name': g.get('name', 'N/A'),
+                          'id': g_id,
+                          'status': g.get('status', 'N/A'),
+                          'visibility': g.get('visibilityStatus', 'N/A'),
+                          'content_filter': has_content_filter,
+                          'topic_policy': has_topic_policy,
+                          'pii_filter': has_pii_filter,
+                          'word_filter': has_word_filter,
+                          'grounding': has_grounding,
+                      })
+          
+                  # Render guardrail table with filter coverage
+                  if guardrail_details:
+                      html += """<br><table style="width: 90%"><tr><th>Guardrail Name</th><th>Status</th><th>Visibility</th>
+                          <th>Content Filter</th><th>Denied Topics</th><th>PII Filter</th><th>Word Filter</th><th>Contextual Grounding</th></tr>"""
+                      for gd in guardrail_details:
+                          yes = '<span style="color: green;">&#10003;</span>'
+                          no = '<span style="color: red;">&#10007;</span>'
+                          html += f"""<tr><td>{escape(gd['name'])}</td><td>{escape(gd['status'])}</td><td>{escape(gd['visibility'])}</td>
+                              <td style="text-align:center;">{yes if gd['content_filter'] else no}</td>
+                              <td style="text-align:center;">{yes if gd['topic_policy'] else no}</td>
+                              <td style="text-align:center;">{yes if gd['pii_filter'] else no}</td>
+                              <td style="text-align:center;">{yes if gd['word_filter'] else no}</td>
+                              <td style="text-align:center;">{yes if gd['grounding'] else no}</td></tr>"""
                       html += "</table>"
+          
+                      # Check for missing critical filters
+                      missing_checks = []
+                      for gd in guardrail_details:
+                          if gd['visibility'] == 'PUBLISHED':
+                              if not gd['content_filter']:
+                                  missing_checks.append(f"'{gd['name']}' is missing <strong>Content Filter</strong> (hate, insult, sexual, violence)")
+                              if not gd['pii_filter']:
+                                  missing_checks.append(f"'{gd['name']}' is missing <strong>PII Filter</strong> (credit cards, SSNs, emails)")
+                              if not gd['topic_policy']:
+                                  missing_checks.append(f"'{gd['name']}' is missing <strong>Denied Topics</strong> (off-topic, competitor mentions)")
+                              if not gd['grounding']:
+                                  missing_checks.append(f"'{gd['name']}' is missing <strong>Contextual Grounding</strong> (hallucination prevention)")
+                      if missing_checks:
+                          html += '<br><span style="color: #FFA500; font-weight: bold;">Missing critical guardrail filters detected:</span><ul>'
+                          for mc in missing_checks:
+                              html += f"<li>{mc}</li>"
+                          html += "</ul>"
+          
+                  # --- Part 2: Check which AI agents have guardrails associated ---
+                  html += "<br><b>AI Agent Guardrail Association</b><br>"
+                  agents = paginate_api_call(qconnect_client.list_ai_agents, 'aiAgentSummaries', assistantId=assistant_id, maxResults=100)
+                  agents_with_guardrail = []
+                  agents_without_guardrail = []
+                  for agent in agents:
+                      a_id = agent.get('aiAgentId', '')
+                      a_name = agent.get('name', 'N/A')
+                      try:
+                          agent_detail = qconnect_client.get_ai_agent(assistantId=assistant_id, aiAgentId=a_id)
+                          ai_agent = agent_detail.get('aiAgent', {})
+                          config = ai_agent.get('configuration', {})
+                          # Check orchestration config for guardrail reference
+                          orch_config = config.get('orchestrationAIAgentConfiguration', {})
+                          guardrail_id = orch_config.get('guardrailId', '')
+                          if not guardrail_id:
+                              # Also check selfServiceAIAgentConfiguration
+                              ss_config = config.get('selfServiceAIAgentConfiguration', {})
+                              guardrail_id = ss_config.get('guardrailId', '')
+                          if guardrail_id:
+                              agents_with_guardrail.append({'name': a_name, 'guardrail_id': guardrail_id})
+                          else:
+                              agents_without_guardrail.append(a_name)
+                      except Exception:
+                          agents_without_guardrail.append(a_name)
+          
+                  total_agents = len(agents)
+                  protected = len(agents_with_guardrail)
+                  unprotected = len(agents_without_guardrail)
+                  html += f"<br>Total AI agents: {total_agents} | With guardrails: {protected} | Without guardrails: {unprotected}<br>"
+          
+                  if agents_with_guardrail:
+                      html += """<br><table style="width: 60%"><tr><th>AI Agent</th><th>Guardrail ID</th></tr>"""
+                      for a in agents_with_guardrail:
+                          html += f"<tr><td>{escape(a['name'])}</td><td>{escape(a['guardrail_id'])}</td></tr>"
+                      html += "</table>"
+                  if agents_without_guardrail:
+                      html += '<br><span style="color: #FFA500;">AI agents without guardrails:</span><ul>'
+                      for a_name in agents_without_guardrail:
+                          html += f"<li>{escape(a_name)}</li>"
+                      html += "</ul>"
+          
+                  # --- Final recommendations ---
                   if not published:
                       html += """<br><span style="color: red; font-weight: bold;">CRITICAL: No published AI guardrails found. PII protection and content filtering are NOT active.</span>"""
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Deploy guardrails covering: (1) PII blocking for credit cards and SSNs, (2) denied topics for off-topic content, (3) contextual grounding with relevance threshold &ge;0.50.</li>
+                  if not published or missing_checks or agents_without_guardrail:
+                      html += """<h4>Recommendation</h4><ul>"""
+                      if not published:
+                          html += "<li>Deploy at least one guardrail with all five filter types enabled.</li>"
+                      if missing_checks:
+                          html += "<li>Add missing filter types to existing guardrails (see table above).</li>"
+                      if agents_without_guardrail:
+                          html += f"<li>{unprotected} AI agent(s) have no guardrail associated — configure guardrails in the AI agent's orchestration settings.</li>"
+                      html += """<li>Recommended filter coverage: Content Filter + PII Filter + Denied Topics + Word Filter + Contextual Grounding.</li>
                           <li>Maximum 3 custom guardrails per assistant.</li>
                           <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-guardrails.html" target="_blank">documentation</a>.</li></ul>"""
                   return html
