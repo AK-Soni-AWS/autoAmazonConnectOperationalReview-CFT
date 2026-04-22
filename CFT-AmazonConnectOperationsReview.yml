@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. This material is AWS Content under the AWS Enterprise Agreement
+# or AWS Customer Agreement (as applicable) and is provided under the AWS Intellectual Property License.
+
 # CloudFormation template for Amazon Connect Operational Review
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'CloudFormation template for Amazon Connect Operational Review with embedded Lambda code. Please use us-east-1 to import this template file.'
@@ -2085,9 +2088,19 @@ Resources:
               html = "<b>Lambda Integration Limits</b><br>"
               logger.info(f"[Q2] Starting Lambda Integration Limits check for instance_id={instance_id}")
               try:
-                  resp = connect_client.list_lambda_functions(InstanceId=instance_id, MaxResults=100)
-                  lambda_functions = resp.get('LambdaFunctions', [])
+                  lambda_functions = []
+                  next_token = None
+                  while True:
+                      kwargs = {'InstanceId': instance_id, 'MaxResults': 25}
+                      if next_token:
+                          kwargs['NextToken'] = next_token
+                      resp = connect_client.list_lambda_functions(**kwargs)
+                      lambda_functions.extend(resp.get('LambdaFunctions', []))
+                      next_token = resp.get('NextToken')
+                      if not next_token:
+                          break
                   total = len(lambda_functions)
+                  logger.info(f"[Q2] Found {total} Lambda function(s)")
                   limit = 50
                   pct = round(total / limit * 100, 1)
                   color = get_color_by_percentage(pct)
