@@ -1582,61 +1582,125 @@ Resources:
                   return None
           
           """C1: AI Agent Inventory & Status"""
-          def check_ai_agent_inventory(assistant_id):
+          def check_ai_agent_inventory(assistant_id, instance_id):
               html = "<b>AI Agent Inventory</b><br>"
-              logger.info(f"[C1] Starting AI Agent Inventory check for assistant_id={assistant_id}")
+              logger.info(f"[O1] Starting AI Agent Inventory check for assistant_id={assistant_id}")
               try:
                   agents = paginate_api_call(qconnect_client.list_ai_agents, 'aiAgentSummaries', assistantId=assistant_id, maxResults=100)
-                  logger.info(f"[C1] list_ai_agents returned {len(agents)} agent(s)")
+                  logger.info(f"[O1] list_ai_agents returned {len(agents)} agent(s)")
                   if not agents:
-                      logger.warning(f"[C1] No AI agents found for assistant {assistant_id}")
+                      logger.warning(f"[O1] No AI agents found for assistant {assistant_id}")
                       html += "<br>No AI agents configured for this assistant."
                       html += """<h4>Recommendation</h4><ul><li>Create self-service and/or agent-assist AI agents in the Connect AI agent designer.</li>
                           <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-agents.html" target="_blank">documentation</a>.</li></ul>"""
                       return html
-          
+
+                  # Build security profile ID-to-name map for lookup
+                  sp_map = {}
+                  try:
+                      sp_resp = connect_client.list_security_profiles(InstanceId=instance_id, MaxResults=100)
+                      for sp in sp_resp.get('SecurityProfileSummaryList', []):
+                          sp_map[sp['Id']] = sp.get('Name', sp['Id'])
+                  except Exception as sp_err:
+                      logger.warning(f"[O1] Could not list security profiles: {sp_err}")
+
                   html += f"<br>Found {len(agents)} AI agent(s).<br><br>"
-                  html += """<table style="width: 80%"><tr><th>Agent Name</th><th>Agent ID</th><th>Type</th><th>Status</th><th>Visibility</th></tr>"""
+                  html += """<table style="width: 100%"><tr><th>Agent Name</th><th>Type</th><th>Status</th><th>MCP Tools</th><th>Security Profile</th></tr>"""
                   for agent in agents:
                       a_id = agent.get('aiAgentId', '')
-                      logger.info(f"[C1] Getting details for agent: {a_id}, raw summary keys: {list(agent.keys())}")
                       try:
                           detail = qconnect_client.get_ai_agent(assistantId=assistant_id, aiAgentId=a_id)
                           ai_agent = detail.get('aiAgent', {})
                           name = escape(ai_agent.get('name', 'N/A'))
                           a_type = escape(ai_agent.get('type', 'N/A'))
                           status = escape(agent.get('status', 'N/A'))
-                          visibility = escape(ai_agent.get('visibilityStatus', 'N/A'))
-                          logger.info(f"[C1] Agent: name={name}, type={a_type}, status={status}, visibility={visibility}")
+
+                          # Extract MCP tools from toolConfigurations
+                          config = ai_agent.get('configuration', {})
+                          orch = config.get('orchestrationAIAgentConfiguration', {})
+                          tools = orch.get('toolConfigurations', [])
+                          mcp_tools = [t for t in tools if t.get('toolType') == 'MODEL_CONTEXT_PROTOCOL']
+                          builtin_tools = [t for t in tools if t.get('toolType') != 'MODEL_CONTEXT_PROTOCOL']
+                          tool_names = [t.get('toolName', t.get('title', 'unknown')) for t in mcp_tools]
+                          if mcp_tools:
+                              tool_display = f"{len(mcp_tools)} MCP"
+                              if builtin_tools:
+                                  tool_display += f" + {len(builtin_tools)} built-in"
+                              tool_color = '#FF0000' if len(mcp_tools) > 30 else '#FFA500' if len(mcp_tools) > 15 else '#00FF00'
+                              tool_cell = f'<span style="color:{tool_color}; font-weight:bold;">{tool_display}</span>'
+                              tool_cell += f'<br><small>{", ".join(escape(n) for n in tool_names[:5])}'
+                              if len(tool_names) > 5:
+                                  tool_cell += f'... +{len(tool_names)-5} more'
+                              tool_cell += '</small>'
+                          elif builtin_tools:
+                              tool_cell = f'{len(builtin_tools)} built-in'
+                          else:
+                              tool_cell = '<span style="color:#999;">None</span>'
+
+                          # Find security profile associated with this agent
+                          sp_cell = '<span style="color:#999;">N/A</span>'
+                          try:
+                              # Check entity security profiles for this AI agent
+                              entity_resp = connect_client.list_security_profiles(InstanceId=instance_id, MaxResults=100)
+                              for sp in entity_resp.get('SecurityProfileSummaryList', []):
+                                  sp_id = sp['Id']
+                                  try:
+                                      sp_detail = connect_client.describe_security_profile(InstanceId=instance_id, SecurityProfileId=sp_id)
+                                      sp_data = sp_detail.get('SecurityProfile', {})
+                                      # Check if this profile has applications (MCP tools) matching agent's tools
+                                      apps = sp_data.get('Applications', [])
+                                      if not apps:
+                                          try:
+                                              app_resp = connect_client.list_security_profile_applications(
+                                                  InstanceId=instance_id, SecurityProfileId=sp_id, MaxResults=100)
+                                              apps = app_resp.get('Applications', [])
+                                          except Exception:
+                                              pass
+                                      if apps and mcp_tools:
+                                          sp_cell = escape(sp.get('Name', sp_id))
+                                          break
+                                  except Exception:
+                                      pass
+                          except Exception:
+                              pass
+
+                          logger.info(f"[O1] Agent: {name}, tools={len(mcp_tools)} MCP + {len(builtin_tools)} built-in")
                       except Exception as detail_err:
-                          logger.warning(f"[C1] Failed to get detail for agent {a_id}: {detail_err}")
+                          logger.warning(f"[O1] Failed to get detail for agent {a_id}: {detail_err}")
                           name = escape(agent.get('name', 'N/A'))
                           a_type = 'N/A'
                           status = escape(agent.get('status', 'N/A'))
-                          visibility = 'N/A'
-                      html += f"<tr><td>{name}</td><td>{escape(a_id)}</td><td>{a_type}</td><td>{status}</td><td>{visibility}</td></tr>"
+                          tool_cell = 'N/A'
+                          sp_cell = 'N/A'
+                      html += f"<tr><td>{name}</td><td>{a_type}</td><td>{status}</td><td>{tool_cell}</td><td>{sp_cell}</td></tr>"
                   html += "</table>"
                   return html
               except Exception as e:
-                  logger.error(f"C1 Error: {e}")
+                  logger.error(f"O1 Error: {e}")
                   return html + f"<br>Error retrieving AI agent inventory: {escape(str(e))}"
           
-          """C2: AI Prompt Configuration Review"""
+          """O2: AI Prompt Configuration Review"""
           def check_ai_prompt_configuration(assistant_id):
               html = "<b>AI Prompt Configuration</b><br>"
-              logger.info(f"[C2] Starting AI Prompt Configuration check for assistant_id={assistant_id}")
+              logger.info(f"[O2] Starting AI Prompt Configuration check for assistant_id={assistant_id}")
               try:
                   prompts = paginate_api_call(qconnect_client.list_ai_prompts, 'aiPromptSummaries', assistantId=assistant_id, maxResults=100)
-                  logger.info(f"[C2] list_ai_prompts returned {len(prompts)} prompt(s)")
+                  logger.info(f"[O2] list_ai_prompts returned {len(prompts)} prompt(s)")
                   if not prompts:
                       html += "<br>No AI prompts configured."
                       html += """<h4>Recommendation</h4><ul><li>Create AI prompts for self-service and agent-assist orchestration.</li></ul>"""
                       return html
-          
-                  html += f"<br>Found {len(prompts)} AI prompt(s).<br><br>"
-                  html += """<table style="width: 80%"><tr><th>Prompt Name</th><th>Type</th><th>Model ID</th><th>Visibility</th></tr>"""
-                  expensive_models = []
-                  EXPENSIVE_PATTERNS = ['claude-3-opus', 'claude-sonnet-4']
+
+                  # Categorize models by size/latency profile
+                  LARGER_MODEL_PATTERNS = ['claude-3-opus', 'claude-sonnet-4', 'claude-3.5-sonnet', 'claude-3-sonnet']
+                  FASTER_MODEL_PATTERNS = ['claude-haiku', 'nova-lite', 'nova-micro', 'titan']
+
+                  html += f"<br>Found {len(prompts)} AI prompt(s).<br>"
+                  html += """<p><em>Note: Connect AI Agents bill at a flat per-message/per-minute rate regardless of model.
+                      Model selection impacts response latency and quality, not cost.</em></p>"""
+                  html += """<table style="width: 90%"><tr><th>Prompt Name</th><th>Type</th><th>Model ID</th><th>Latency Profile</th></tr>"""
+                  larger_models = []
+                  model_summary = {}
                   for p in prompts:
                       p_id = p.get('aiPromptId', '')
                       try:
@@ -1645,22 +1709,45 @@ Resources:
                           name = escape(prompt.get('name', 'N/A'))
                           p_type = escape(prompt.get('type', 'N/A'))
                           model_id = escape(prompt.get('modelId', 'N/A'))
-                          visibility = escape(prompt.get('visibilityStatus', 'N/A'))
                       except Exception:
                           name = escape(p.get('name', 'N/A'))
                           p_type = 'N/A'
                           model_id = 'N/A'
-                          visibility = 'N/A'
-                      if any(pat in model_id.lower() for pat in EXPENSIVE_PATTERNS):
-                          expensive_models.append(f"{name} ({model_id})")
-                      html += f"<tr><td>{name}</td><td>{p_type}</td><td>{model_id}</td><td>{visibility}</td></tr>"
+
+                      # Determine latency profile
+                      if any(pat in model_id.lower() for pat in LARGER_MODEL_PATTERNS):
+                          latency_profile = 'Higher latency (larger model)'
+                          latency_color = '#FFA500'
+                          larger_models.append(name)
+                      elif any(pat in model_id.lower() for pat in FASTER_MODEL_PATTERNS):
+                          latency_profile = 'Lower latency (faster model)'
+                          latency_color = '#00FF00'
+                      else:
+                          latency_profile = 'Standard'
+                          latency_color = '#CCCCCC'
+
+                      # Track model distribution
+                      short_model = model_id.split(':')[0] if ':' in model_id else model_id
+                      model_summary[short_model] = model_summary.get(short_model, 0) + 1
+
+                      html += f'<tr><td>{name}</td><td>{p_type}</td><td>{model_id}</td><td style="background-color: {latency_color};">{latency_profile}</td></tr>'
                   html += "</table>"
-                  if expensive_models:
-                      html += f"""<h4>Recommendation</h4><ul><li>Found {len(expensive_models)} prompt(s) using expensive models: {', '.join(expensive_models)}.</li>
-                          <li>Consider using Claude Haiku or Nova Lite for self-service orchestration to reduce cost.</li></ul>"""
+
+                  # Model distribution summary
+                  html += "<br><b>Model Distribution:</b><br>"
+                  html += """<table style="width: 50%"><tr><th>Model</th><th>Prompt Count</th></tr>"""
+                  for model, count in sorted(model_summary.items(), key=lambda x: x[1], reverse=True):
+                      html += f"<tr><td>{escape(model)}</td><td>{count}</td></tr>"
+                  html += "</table>"
+
+                  if larger_models:
+                      html += f"""<h4>Performance Consideration</h4><ul>
+                          <li>{len(larger_models)} prompt(s) use larger models with higher latency. This is expected for agent-assist use cases requiring higher quality responses.</li>
+                          <li>For self-service (customer-facing) prompts where response speed matters, consider faster models like Claude Haiku or Nova Lite.</li>
+                          <li>Larger models increase the LLM inference time per turn, which compounds with MCP tool evaluation overhead (see S4 check).</li></ul>"""
                   return html
               except Exception as e:
-                  logger.error(f"C2 Error: {e}")
+                  logger.error(f"O2 Error: {e}")
                   return html + f"<br>Error retrieving AI prompt configuration: {escape(str(e))}"
           
           """S1: Q in Connect AI Guardrails"""
@@ -1743,57 +1830,77 @@ Resources:
                   # --- Part 2: Check which AI agents have guardrails associated ---
                   html += "<br><b>AI Agent Guardrail Association</b><br>"
                   agents = paginate_api_call(qconnect_client.list_ai_agents, 'aiAgentSummaries', assistantId=assistant_id, maxResults=100)
-                  agents_with_guardrail = []
+                  agents_with_guardrail_published = []
+                  agents_with_guardrail_draft_only = []
                   agents_without_guardrail = []
+
                   for agent in agents:
                       a_id = agent.get('aiAgentId', '')
                       a_name = agent.get('name', 'N/A')
+                      a_visibility = agent.get('visibilityStatus', '')
+
+                      def extract_guardrail_id(agent_data):
+                          config = agent_data.get('configuration', {})
+                          orch = config.get('orchestrationAIAgentConfiguration', {})
+                          g_id = orch.get('orchestrationAIGuardrailId', '')
+                          if not g_id:
+                              g_id = orch.get('guardrailId', '')
+                          if not g_id:
+                              ss = config.get('selfServiceAIAgentConfiguration', {})
+                              g_id = ss.get('orchestrationAIGuardrailId', '') or ss.get('guardrailId', '')
+                          return g_id
+
                       try:
-                          agent_detail = qconnect_client.get_ai_agent(assistantId=assistant_id, aiAgentId=a_id)
-                          ai_agent = agent_detail.get('aiAgent', {})
-                          config = ai_agent.get('configuration', {})
-                          # Check orchestration config for guardrail reference
-                          orch_config = config.get('orchestrationAIAgentConfiguration', {})
-                          guardrail_id = orch_config.get('guardrailId', '')
-                          if not guardrail_id:
-                              # Also check selfServiceAIAgentConfiguration
-                              ss_config = config.get('selfServiceAIAgentConfiguration', {})
-                              guardrail_id = ss_config.get('guardrailId', '')
-                          if guardrail_id:
-                              agents_with_guardrail.append({'name': a_name, 'guardrail_id': guardrail_id})
+                          latest_resp = qconnect_client.get_ai_agent(assistantId=assistant_id, aiAgentId=a_id)
+                          latest_agent = latest_resp.get('aiAgent', {})
+                          latest_guardrail = extract_guardrail_id(latest_agent)
+
+                          if latest_guardrail and a_visibility == 'PUBLISHED':
+                              agents_with_guardrail_published.append({
+                                  'name': a_name, 'guardrail_id': latest_guardrail, 'status': 'PUBLISHED'})
+                          elif latest_guardrail:
+                              agents_with_guardrail_draft_only.append({
+                                  'name': a_name, 'guardrail_id': latest_guardrail, 'status': 'DRAFT ONLY'})
                           else:
                               agents_without_guardrail.append(a_name)
                       except Exception:
                           agents_without_guardrail.append(a_name)
-          
+
                   total_agents = len(agents)
-                  protected = len(agents_with_guardrail)
+                  pub_protected = len(agents_with_guardrail_published)
+                  draft_only = len(agents_with_guardrail_draft_only)
                   unprotected = len(agents_without_guardrail)
-                  html += f"<br>Total AI agents: {total_agents} | With guardrails: {protected} | Without guardrails: {unprotected}<br>"
-          
-                  if agents_with_guardrail:
-                      html += """<br><table style="width: 60%"><tr><th>AI Agent</th><th>Guardrail ID</th></tr>"""
-                      for a in agents_with_guardrail:
-                          html += f"<tr><td>{escape(a['name'])}</td><td>{escape(a['guardrail_id'])}</td></tr>"
+                  html += f"<br>Total AI agents: {total_agents} | Guardrail active: {pub_protected} | Guardrail draft-only: {draft_only} | No guardrail: {unprotected}<br>"
+
+                  if agents_with_guardrail_published or agents_with_guardrail_draft_only:
+                      html += """<br><table style="width: 70%"><tr><th>AI Agent</th><th>Guardrail ID</th><th>Status</th></tr>"""
+                      for a in agents_with_guardrail_published:
+                          html += f'<tr><td>{escape(a["name"])}</td><td>{escape(a["guardrail_id"])}</td><td style="background-color: #00FF00;">ACTIVE</td></tr>'
+                      for a in agents_with_guardrail_draft_only:
+                          html += f'<tr><td>{escape(a["name"])}</td><td>{escape(a["guardrail_id"])}</td><td style="background-color: #FFA500;">DRAFT ONLY</td></tr>'
                       html += "</table>"
+                  if draft_only > 0:
+                      html += f'<br><span style="color: #FFA500; font-weight: bold;">{draft_only} agent(s) have guardrails in draft/SAVED state only — publish the agent to activate.</span><br>'
                   if agents_without_guardrail:
-                      html += '<br><span style="color: #FFA500;">AI agents without guardrails:</span><ul>'
+                      html += '<br><span style="color: #FFA500;">AI agents without any guardrail:</span><ul>'
                       for a_name in agents_without_guardrail:
                           html += f"<li>{escape(a_name)}</li>"
                       html += "</ul>"
-          
+
                   # --- Final recommendations ---
                   if not published:
-                      html += """<br><span style="color: red; font-weight: bold;">CRITICAL: No published AI guardrails found. PII protection and content filtering are NOT active.</span>"""
-                  if not published or missing_checks or agents_without_guardrail:
+                      html += """<br><span style="color: red; font-weight: bold;">CRITICAL: No published AI guardrails found.</span>"""
+                  if not published or missing_checks or agents_without_guardrail or agents_with_guardrail_draft_only:
                       html += """<h4>Recommendation</h4><ul>"""
                       if not published:
                           html += "<li>Deploy at least one guardrail with all five filter types enabled.</li>"
                       if missing_checks:
                           html += "<li>Add missing filter types to existing guardrails (see table above).</li>"
+                      if agents_with_guardrail_draft_only:
+                          html += f"<li>{draft_only} agent(s) have guardrails in draft state — publish the agent version to activate.</li>"
                       if agents_without_guardrail:
-                          html += f"<li>{unprotected} AI agent(s) have no guardrail associated — configure guardrails in the AI agent's orchestration settings.</li>"
-                      html += """<li>Recommended filter coverage: Content Filter + PII Filter + Denied Topics + Word Filter + Contextual Grounding.</li>
+                          html += f"<li>{unprotected} agent(s) have no guardrail — configure in the AI agent orchestration settings.</li>"
+                      html += """<li>Recommended: Content Filter + PII Filter + Denied Topics + Word Filter + Contextual Grounding.</li>
                           <li>Maximum 3 custom guardrails per assistant.</li>
                           <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-guardrails.html" target="_blank">documentation</a>.</li></ul>"""
                   return html
@@ -1863,11 +1970,13 @@ Resources:
                           html += f"<tr><td>{escape(d.get('id', 'N/A'))}</td><td>{escape(d.get('deliverySourceName', 'N/A'))}</td><td>{escape(d.get('deliveryDestinationType', 'N/A'))}</td></tr>"
                       html += "</table>"
                   else:
-                      html += """<br><span style="color: red; font-weight: bold;">No CloudWatch log delivery configured for AI Agent events.</span>"""
+                      html += """<br><span style="color: #FFA500; font-weight: bold;">No CloudWatch Vended Logs delivery configured for AI Agent event logs.</span>"""
+                      html += """<p><em>Note: This checks for AI Agent-specific event log delivery (TRANSCRIPT_AGENTIC_MESSAGE, TRANSCRIPT_SELF_SERVICE_MESSAGE, etc.),
+                          not standard Connect contact flow logging which may be enabled separately at the instance level.</em></p>"""
                       html += """<h4>Recommendation</h4><ul>
-                          <li>Enable AI Agent event logging via CloudWatch Vended Logs delivery for the assistant.</li>
-                          <li>This is required for analytics: tool usage, session analysis, LLM tracking, intent detection.</li>
-                          <li>Supported event types: TRANSCRIPT_AGENTIC_MESSAGE, TRANSCRIPT_SELF_SERVICE_MESSAGE, TRANSCRIPT_CREATE_SESSION, TRANSCRIPT_LARGE_LANGUAGE_MODEL_INVOCATION, TRANSCRIPT_RECOMMENDATION, and more.</li>
+                          <li>Enable AI Agent event logging via CloudWatch Vended Logs delivery for the assistant ARN.</li>
+                          <li>This provides granular AI agent observability: tool invocation traces, LLM token usage, session analytics, intent detection, and recommendation tracking.</li>
+                          <li>Standard contact flow logging (if enabled) does not capture these AI agent-specific events.</li>
                           <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/monitor-ai-agents.html" target="_blank">documentation</a>.</li></ul>"""
                   return html
               except Exception as e:
@@ -2454,10 +2563,12 @@ Resources:
                   flows_without_logging = find_flows_without_logging_enabled(instance_id)
           
                   if flows_without_logging.__len__() == 0:
-                      html_output += f"""<br> No contact flows without logging enabled found."""
+                      html_output += f"""<br> All contact flows have explicit logging behavior blocks configured."""
                   else:
                       html_output += f"""
-                             <br>{flows_without_logging.__len__()} contact flows without logging enabled found.<br><br>
+                             <br>{flows_without_logging.__len__()} contact flows without an explicit <em>Set logging behavior</em> block.<br>
+                             <em>Note: If instance-level flow logging is enabled, these flows may still generate logs via the instance default.
+                             Adding explicit logging blocks is a best practice to prevent silent log loss if instance settings change.</em><br><br>
                               <table style="width: 80%">
                                       <tr><th>Flow Name</th><th>Flow ID</th><th>Flow Type</th><th>Status</th><th>State</th></tr>"""
           
@@ -2468,7 +2579,8 @@ Resources:
                       html_output += f"""</table>
                       <h4>Recommendations</h4>
                       <ul>
-                          <li>Use a Set logging behavior block to enable or disable logging for segments of the flow where sensitive information is collected and can't be stored in CloudWatch.</li>
+                          <li>Add explicit <em>Set logging behavior</em> blocks to all flows as a best practice, even if instance-level logging is enabled.</li>
+                          <li>This ensures logging persists independently of instance-level settings and allows per-flow control over sensitive data segments.</li>
                           <li>Learn more about contact flow <a href="https://docs.aws.amazon.com/connect/latest/adminguide/about-contact-flow-logs.html" target="_blank">logging</a>.</li>
                       </ul>
                       """
@@ -2648,14 +2760,14 @@ Resources:
                           # --- O1: AI Agent Inventory ---
                           html_output += '<div class="section"><h3>O1: AI Agent Inventory &amp; Status</h3>'
                           html_output += '<p><em>Lists all AI agents configured for this assistant, their types (self-service/agent-assist), and deployment status.</em></p>'
-                          html_output += check_ai_agent_inventory(assistant_id)
+                          html_output += check_ai_agent_inventory(assistant_id, instance_id)
                           html_output += '</div>'
                           logger.info(f"O1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
                           # --- O2: AI Prompt Configuration ---
                           html_output += '<div class="section"><h3>O2: AI Prompt Configuration Review</h3>'
-                          html_output += '<p><em>Reviews AI prompt settings including model selection and flags expensive models that could be replaced with cost-effective alternatives.</em></p>'
+                          html_output += '<p><em>Reviews AI prompt model selection — model choice affects response latency and quality, not cost (Connect bills flat rate per message).</em></p>'
                           html_output += check_ai_prompt_configuration(assistant_id)
                           html_output += '</div>'
                           logger.info(f"O2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
