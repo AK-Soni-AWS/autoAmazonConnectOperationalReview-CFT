@@ -132,26 +132,13 @@ Resources:
           Statement:
           - Resource: "*"
             Action:
-              - "bedrock:ListGuardrails"
-              - "bedrock:GetGuardrail"
-              - "bedrock:ListInferenceProfiles"
-              - "bedrock:GetInferenceProfile"
-              - "bedrock:GetModelInvocationLoggingConfiguration"
-              - "bedrock:ListFoundationModels"
-            Effect: "Allow"
-            Sid: "BedrockReadAccess"
-        PolicyName: "BedrockReadOnlyAccess"
-      - PolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-          - Resource: "*"
-            Action:
               - "logs:DescribeDeliveries"
               - "logs:DescribeDeliverySources"
               - "logs:DescribeDeliveryDestinations"
               - "connect:ListIntegrationAssociations"
               - "connect:ListInstanceStorageConfigs"
               - "connect:ListSecurityProfiles"
+              - "connect:DescribeSecurityProfile"
               - "connect:ListLambdaFunctions"
             Effect: "Allow"
             Sid: "AIAgentSupportAccess"
@@ -166,7 +153,7 @@ Resources:
       Role: !GetAtt AmazonConnectOperationalReviewLambdaExecutionRole.Arn
       Runtime: python3.13
       Timeout: 900
-      MemorySize: 256
+      MemorySize: 1024
       Environment:
         Variables:
           CONNECT_INSTANCE_ARN: !Ref AmazonConnectInstanceARN
@@ -224,9 +211,6 @@ Resources:
 
           # Initialize Q in Connect client for AI Agent checks
           qconnect_client = boto3.client('qconnect')
-
-          # Initialize Bedrock client for AI Agent checks
-          bedrock_client = boto3.client('bedrock')
 
           """Parse instance_id and aws_region from Amazon Connect instance ARN"""
           def parse_connect_instance_arn(instance_arn):
@@ -1637,29 +1621,6 @@ Resources:
                   logger.error(f"S1 Error: {e}")
                   return html + f"<br>Error checking guardrails: {escape(str(e))}"
 
-          """S2: Bedrock Guardrails Active"""
-          def check_bedrock_guardrails():
-              html = "<b>Bedrock Guardrails</b><br>"
-              try:
-                  response = bedrock_client.list_guardrails(maxResults=100)
-                  guardrails = response.get('guardrails', [])
-                  html += f"<br>Found {len(guardrails)} Bedrock guardrail(s) in this region.<br>"
-                  if guardrails:
-                      html += """<br><table style="width: 80%"><tr><th>Name</th><th>Guardrail ID</th><th>Status</th><th>Version</th></tr>"""
-                      for g in guardrails:
-                          html += f"<tr><td>{escape(g.get('name', 'N/A'))}</td><td>{escape(g.get('id', 'N/A'))}</td><td>{escape(g.get('status', 'N/A'))}</td><td>{escape(g.get('version', 'N/A'))}</td></tr>"
-                      html += "</table>"
-                  else:
-                      html += """<br><span style="color: red;">No Bedrock guardrails found in this region.</span>"""
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Create a dedicated Bedrock Guardrail for each Connect use case with content filters, PII filters, and denied topics.</li>
-                          <li>Monitor via CloudWatch namespace <code>AWS/Bedrock/Guardrails</code> - track <code>InvocationsIntervened</code>.</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html" target="_blank">documentation</a>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"S2 Error: {e}")
-                  return html + f"<br>Error checking Bedrock guardrails: {escape(str(e))}"
-
           """S4: Q in Connect Domain Encryption"""
           def check_q_domain_encryption(assistant_id):
               html = "<b>Q in Connect Domain Encryption</b><br>"
@@ -1680,36 +1641,6 @@ Resources:
               except Exception as e:
                   logger.error(f"S4 Error: {e}")
                   return html + f"<br>Error checking domain encryption: {escape(str(e))}"
-
-          """S5: Bedrock Model Invocation Logging"""
-          def check_bedrock_invocation_logging():
-              html = "<b>Bedrock Model Invocation Logging</b><br>"
-              try:
-                  response = bedrock_client.get_model_invocation_logging_configuration()
-                  config = response.get('loggingConfig', {})
-                  s3_config = config.get('s3Config', {})
-                  cw_config = config.get('cloudWatchConfig', {})
-                  s3_enabled = bool(s3_config.get('bucketName'))
-                  cw_enabled = bool(cw_config.get('logGroupName'))
-                  text_enabled = config.get('textDataDeliveryEnabled', False)
-                  image_enabled = config.get('imageDataDeliveryEnabled', False)
-
-                  html += f"""<br><table style="width: 50%">
-                      <tr><th>Setting</th><th>Value</th></tr>
-                      <tr><td>S3 Logging</td><td>{'Enabled - ' + escape(s3_config.get('bucketName', '')) if s3_enabled else 'Disabled'}</td></tr>
-                      <tr><td>CloudWatch Logging</td><td>{'Enabled - ' + escape(cw_config.get('logGroupName', '')) if cw_enabled else 'Disabled'}</td></tr>
-                      <tr><td>Text Data Delivery</td><td>{text_enabled}</td></tr>
-                      <tr><td>Image Data Delivery</td><td>{image_enabled}</td></tr>
-                      </table>"""
-                  if not s3_enabled and not cw_enabled:
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Enable model invocation logging for audit trail and compliance.</li>
-                          <li>CAUTION: If processing PII/sensitive data, ensure the logging destination has appropriate encryption and access controls.</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html" target="_blank">documentation</a>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"S5 Error: {e}")
-                  return html + f"<br>Error checking invocation logging: {escape(str(e))}"
 
           """P1: AI Agent Logging & Observability"""
           def check_ai_agent_logging(assistant_id, account_id, aws_region):
@@ -1790,33 +1721,6 @@ Resources:
                   logger.error(f"Q2 Error: {e}")
                   return html + f"<br>Error checking Q in Connect limits: {escape(str(e))}"
 
-          """R2: Cross-Region Inference Profiles"""
-          def check_cross_region_inference():
-              html = "<b>Bedrock Cross-Region Inference Profiles</b><br>"
-              try:
-                  response = bedrock_client.list_inference_profiles(maxResults=100)
-                  profiles = response.get('inferenceProfileSummaries', [])
-                  cross_region_prefixes = ['us.', 'eu.', 'ap.', 'global.']
-                  cross_region = [p for p in profiles if any(p.get('inferenceProfileName', '').startswith(pfx) for pfx in cross_region_prefixes)]
-                  single_region = [p for p in profiles if p not in cross_region]
-
-                  html += f"<br>Total inference profiles: {len(profiles)} (Cross-region: {len(cross_region)}, Single-region: {len(single_region)})<br>"
-                  if cross_region:
-                      html += """<br><table style="width: 80%"><tr><th>Profile Name</th><th>Profile ID</th><th>Type</th><th>Status</th></tr>"""
-                      for p in cross_region[:20]:
-                          html += f"<tr><td>{escape(p.get('inferenceProfileName', 'N/A'))}</td><td>{escape(p.get('inferenceProfileId', 'N/A'))}</td><td>{escape(p.get('type', 'N/A'))}</td><td>{escape(p.get('status', 'N/A'))}</td></tr>"
-                      html += "</table>"
-                  if not cross_region:
-                      html += """<br><span style="color: orange;">No cross-region inference profiles detected.</span>"""
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Use geographic cross-region inference profiles (us.*, eu.*) for resilience and up to 2x effective quota.</li>
-                          <li>For data residency requirements, use geographic profiles (not global.*).</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html" target="_blank">documentation</a>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"R2 Error: {e}")
-                  return html + f"<br>Error checking inference profiles: {escape(str(e))}"
-
           """R3: Knowledge Base Association & Sync Health"""
           def check_kb_sync_health(assistant_id):
               html = "<b>Knowledge Base Sync Health</b><br>"
@@ -1869,98 +1773,6 @@ Resources:
               except Exception as e:
                   logger.error(f"R3 Error: {e}")
                   return html + f"<br>Error checking KB sync health: {escape(str(e))}"
-
-          """P6: Bedrock Invocation Latency"""
-          def check_bedrock_latency(days_back):
-              html = "<b>Bedrock Model Invocation Latency</b><br>"
-              try:
-                  end_time = datetime.utcnow()
-                  start_time = end_time - timedelta(days=days_back)
-                  metrics_resp = cloudwatch_client.list_metrics(Namespace='AWS/Bedrock', MetricName='InvocationLatency')
-                  model_metrics = metrics_resp.get('Metrics', [])
-                  if not model_metrics:
-                      html += "<br>No Bedrock invocation latency data found for this period."
-                      return html
-
-                  html += f"<br>Analyzing latency for {len(model_metrics)} model dimension(s) over last {days_back} days.<br><br>"
-                  html += """<table style="width: 70%"><tr><th>Model ID</th><th>Avg Latency (ms)</th><th>Max Latency (ms)</th><th>Status</th></tr>"""
-                  for metric in model_metrics[:15]:
-                      dims = {d['Name']: d['Value'] for d in metric.get('Dimensions', [])}
-                      model_id = dims.get('ModelId', 'Unknown')
-                      try:
-                          stats = cloudwatch_client.get_metric_statistics(
-                              Namespace='AWS/Bedrock', MetricName='InvocationLatency',
-                              Dimensions=metric['Dimensions'], StartTime=start_time, EndTime=end_time,
-                              Period=86400, Statistics=['Average', 'Maximum'])
-                          dps = stats.get('Datapoints', [])
-                          if dps:
-                              avg_lat = round(sum(d['Average'] for d in dps) / len(dps), 0)
-                              max_lat = round(max(d['Maximum'] for d in dps), 0)
-                              status = "CRITICAL" if max_lat > 7000 else "WARNING" if max_lat > 5000 else "OK"
-                              color = "#FF0000" if status == "CRITICAL" else "#FFA500" if status == "WARNING" else "#00FF00"
-                          else:
-                              avg_lat = 'N/A'
-                              max_lat = 'N/A'
-                              status = 'NO DATA'
-                              color = '#CCCCCC'
-                      except Exception:
-                          avg_lat = 'Error'
-                          max_lat = 'Error'
-                          status = 'ERROR'
-                          color = '#FFA500'
-                      html += f'<tr><td>{escape(model_id)}</td><td>{avg_lat}</td><td>{max_lat}</td><td style="background-color: {color};">{status}</td></tr>'
-                  html += "</table>"
-                  html += """<h4>Guidance</h4><ul>
-                      <li>Connect synchronous Lambda timeout is 8 seconds. Target model p99 latency &lt;5000ms.</li>
-                      <li>If latency exceeds limits, switch to a faster model (Haiku/Nova Lite) or reduce <code>max_tokens</code>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"P6 Error: {e}")
-                  return html + f"<br>Error checking Bedrock latency: {escape(str(e))}"
-
-          """P7: Bedrock Throttling Rate"""
-          def check_bedrock_throttling(days_back):
-              html = "<b>Bedrock Invocation Throttling</b><br>"
-              try:
-                  end_time = datetime.utcnow()
-                  start_time = end_time - timedelta(days=days_back)
-                  metrics_resp = cloudwatch_client.list_metrics(Namespace='AWS/Bedrock', MetricName='InvocationThrottles')
-                  model_metrics = metrics_resp.get('Metrics', [])
-                  if not model_metrics:
-                      html += "<br>No Bedrock throttling metrics found. This indicates no throttling has occurred or no Bedrock usage in this region."
-                      return html
-
-                  html += f"<br>Checking throttling for {len(model_metrics)} model dimension(s) over last {days_back} days.<br><br>"
-                  html += """<table style="width: 60%"><tr><th>Model ID</th><th>Total Throttles</th><th>Status</th></tr>"""
-                  total_throttles = 0
-                  for metric in model_metrics[:15]:
-                      dims = {d['Name']: d['Value'] for d in metric.get('Dimensions', [])}
-                      model_id = dims.get('ModelId', 'Unknown')
-                      try:
-                          stats = cloudwatch_client.get_metric_statistics(
-                              Namespace='AWS/Bedrock', MetricName='InvocationThrottles',
-                              Dimensions=metric['Dimensions'], StartTime=start_time, EndTime=end_time,
-                              Period=86400, Statistics=['Sum'])
-                          dps = stats.get('Datapoints', [])
-                          throttles = int(sum(d.get('Sum', 0) for d in dps))
-                          total_throttles += throttles
-                          status = "CRITICAL" if throttles >= 10 else "WARNING" if throttles > 0 else "OK"
-                          color = "#FF0000" if status == "CRITICAL" else "#FFA500" if status == "WARNING" else "#00FF00"
-                      except Exception:
-                          throttles = 'Error'
-                          status = 'ERROR'
-                          color = '#FFA500'
-                      html += f'<tr><td>{escape(model_id)}</td><td>{throttles}</td><td style="background-color: {color};">{status}</td></tr>'
-                  html += "</table>"
-                  if total_throttles > 0:
-                      html += f"""<h4>Recommendation</h4><ul>
-                          <li>{total_throttles} total throttle(s) detected. Request TPM quota increase via AWS Support.</li>
-                          <li>Use cross-region inference profiles for up to 2x effective quota.</li>
-                          <li>Implement exponential backoff with jitter in retry logic.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"P7 Error: {e}")
-                  return html + f"<br>Error checking Bedrock throttling: {escape(str(e))}"
 
           """P8: Connect Contact Flow Errors"""
           def check_flow_errors(instance_id, days_back):
@@ -2178,6 +1990,119 @@ Resources:
               except Exception as e:
                   logger.error(f"P11 Error: {e}")
                   return html + f"<br>Error: {escape(str(e))}"
+
+          """SEC-MCP: MCP Tool Sprawl Detection"""
+          def check_mcp_tool_sprawl(instance_id):
+              html = "<b>MCP Tool Sprawl &amp; Unused Tool Detection</b><br>"
+              html += """<div style="background-color: #e8f4f8; padding: 10px; margin: 10px 0; border-left: 4px solid #0073bb;">
+                  <p><strong>Why This Check Matters:</strong> When an AI agent has many MCP tools, the LLM must evaluate ALL tools
+                  during each inference cycle, directly increasing response latency.</p>
+                  <p><strong>Real incident (2026-04-21):</strong> Adding 46 MCP tools across 11 API targets caused immediate,
+                  measurable latency. Removing unused tools resolved it.</p>
+                  <p><strong>Thresholds:</strong> &#x1F7E2; &le;15 tools | &#x1F7E0; 16-30 tools | &#x1F534; &gt;30 tools (proven latency)</p></div>"""
+              try:
+                  profiles_resp = connect_client.list_security_profiles(InstanceId=instance_id, MaxResults=100)
+                  security_profiles = profiles_resp.get('SecurityProfileSummaryList', [])
+
+                  profile_analysis = []
+                  has_critical = False
+                  total_mcp_tools = 0
+
+                  for profile_summary in security_profiles:
+                      profile_id = profile_summary['Id']
+                      profile_name = profile_summary.get('Name', 'Unknown')
+                      try:
+                          detail = connect_client.describe_security_profile(
+                              InstanceId=instance_id,
+                              SecurityProfileId=profile_id
+                          )
+                          security_profile = detail.get('SecurityProfile', {})
+                          applications = security_profile.get('Applications', [])
+
+                          mcp_tools = []
+                          api_targets = {}
+                          for app in applications:
+                              namespace = app.get('Namespace', 'Unknown')
+                              permissions = app.get('ApplicationPermissions', [])
+                              for permission in permissions:
+                                  parts = permission.split('___')
+                                  target = parts[0] if len(parts) > 1 else 'Unknown'
+                                  operation = parts[1] if len(parts) > 1 else permission
+                                  mcp_tools.append({'namespace': namespace, 'tool_name': permission, 'api_target': target, 'operation': operation})
+                                  if target not in api_targets:
+                                      api_targets[target] = []
+                                  api_targets[target].append(operation)
+
+                          tool_count = len(mcp_tools)
+                          total_mcp_tools += tool_count
+
+                          if tool_count > 30:
+                              status = 'FAIL'
+                              has_critical = True
+                              severity = 'CRITICAL'
+                              color = '#FF0000'
+                          elif tool_count > 15:
+                              status = 'WARNING'
+                              severity = 'HIGH'
+                              color = '#FFA500'
+                          elif tool_count > 0:
+                              status = 'PASS'
+                              severity = 'OK'
+                              color = '#00FF00'
+                          else:
+                              status = 'INFO'
+                              severity = 'N/A'
+                              color = '#CCCCCC'
+
+                          profile_analysis.append({
+                              'name': profile_name, 'id': profile_id,
+                              'tool_count': tool_count, 'target_count': len(api_targets),
+                              'api_targets': api_targets, 'status': status,
+                              'severity': severity, 'color': color
+                          })
+                      except ClientError as e:
+                          logger.warning(f"Could not describe security profile {profile_id}: {e}")
+
+                  profiles_with_mcp = [p for p in profile_analysis if p['tool_count'] > 0]
+                  critical_profiles = [p for p in profile_analysis if p['status'] == 'FAIL']
+
+                  html += f"<br><strong>Summary:</strong> {len(security_profiles)} profiles scanned | "
+                  html += f"{len(profiles_with_mcp)} with MCP tools | "
+                  html += f"{len(critical_profiles)} critical | "
+                  html += f"{total_mcp_tools} total MCP tools<br><br>"
+
+                  if profiles_with_mcp:
+                      html += """<table style="width: 80%"><tr><th>Security Profile</th><th>MCP Tools</th><th>API Targets</th><th>Status</th></tr>"""
+                      for p in sorted(profile_analysis, key=lambda x: x['tool_count'], reverse=True):
+                          if p['tool_count'] > 0:
+                              html += f'<tr><td><strong>{escape(p["name"])}</strong></td>'
+                              html += f'<td style="text-align:center;"><strong>{p["tool_count"]}</strong></td>'
+                              html += f'<td style="text-align:center;">{p["target_count"]}</td>'
+                              html += f'<td style="background-color: {p["color"]}; text-align:center;">{p["severity"]}</td></tr>'
+                      html += "</table>"
+
+                      # Show API target breakdown for critical profiles
+                      for p in critical_profiles:
+                          html += f"<br><strong>Profile: {escape(p['name'])} — {p['tool_count']} tools across {p['target_count']} API targets:</strong><br>"
+                          html += """<table style="width: 60%"><tr><th>API Target</th><th>Operations</th></tr>"""
+                          for target, ops in p['api_targets'].items():
+                              html += f"<tr><td>{escape(target)}</td><td>{len(ops)} ({', '.join(escape(o) for o in ops[:5])}{'...' if len(ops) > 5 else ''})</td></tr>"
+                          html += "</table>"
+                  else:
+                      html += "<br>No MCP tools configured on any security profile."
+
+                  if has_critical:
+                      html += """<div style="background-color: #ffebee; padding: 10px; margin: 10px 0; border-left: 4px solid #d32f2f;">
+                          <h4>Immediate Action Required</h4><ol>
+                          <li><strong>Audit usage:</strong> Check CloudWatch Logs for which MCP tools are actually invoked by AI agents.</li>
+                          <li><strong>Remove unused:</strong> Remove permissions not used by the AI agent's specific use case.</li>
+                          <li><strong>Role-specific profiles:</strong> Create separate security profiles per AI agent instead of one with all tools.</li>
+                          <li><strong>Test latency:</strong> Verify improvement after reduction.</li></ol></div>"""
+                  return html
+              except Exception as e:
+                  logger.error(f"SEC-MCP Error: {e}")
+                  return html + f"<br>Error checking MCP tool sprawl: {escape(str(e))}"
+
           """Main Handler"""
           def lambda_handler(event, context):
               try:
@@ -2575,25 +2500,11 @@ Resources:
                           logger.info(f"S1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
 
-                          # --- S2: Bedrock Guardrails ---
-                          html_output += '<div class="section"><h3>S2: Bedrock Guardrails</h3>'
-                          html_output += check_bedrock_guardrails()
-                          html_output += '</div>'
-                          logger.info(f"S2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
                           # --- S4: Domain Encryption ---
                           html_output += '<div class="section"><h3>S4: Q in Connect Domain Encryption</h3>'
                           html_output += check_q_domain_encryption(assistant_id)
                           html_output += '</div>'
                           logger.info(f"S4 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- S5: Bedrock Invocation Logging ---
-                          html_output += '<div class="section"><h3>S5: Bedrock Model Invocation Logging</h3>'
-                          html_output += check_bedrock_invocation_logging()
-                          html_output += '</div>'
-                          logger.info(f"S5 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
 
                           # --- Performance Checks ---
@@ -2606,20 +2517,6 @@ Resources:
                           logger.info(f"P1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
 
-                          # --- P6: Bedrock Latency ---
-                          html_output += '<div class="section"><h3>P6: Bedrock Invocation Latency</h3>'
-                          html_output += check_bedrock_latency(days_back)
-                          html_output += '</div>'
-                          logger.info(f"P6 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- P7: Bedrock Throttling ---
-                          html_output += '<div class="section"><h3>P7: Bedrock Invocation Throttling</h3>'
-                          html_output += check_bedrock_throttling(days_back)
-                          html_output += '</div>'
-                          logger.info(f"P7 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
                           # --- P8: Flow Errors ---
                           html_output += '<div class="section"><h3>P8: Contact Flow Errors</h3>'
                           html_output += check_flow_errors(instance_id, days_back)
@@ -2627,15 +2524,15 @@ Resources:
                           logger.info(f"P8 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
 
+                          # --- SEC-MCP: MCP Tool Sprawl Detection ---
+                          html_output += '<div class="section"><h3>SEC-MCP: MCP Tool Sprawl Detection</h3>'
+                          html_output += check_mcp_tool_sprawl(instance_id)
+                          html_output += '</div>'
+                          logger.info(f"SEC-MCP completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+
                           # --- Resilience Checks ---
                           html_output += """<h2>AI Agent Resilience</h2>"""
-
-                          # --- R2: Cross-Region Inference ---
-                          html_output += '<div class="section"><h3>R2: Cross-Region Inference Profiles</h3>'
-                          html_output += check_cross_region_inference()
-                          html_output += '</div>'
-                          logger.info(f"R2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
 
                           # --- R3: KB Sync Health ---
                           html_output += '<div class="section"><h3>R3: Knowledge Base Sync Health</h3>'
