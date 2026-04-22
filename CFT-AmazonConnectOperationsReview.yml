@@ -15,7 +15,6 @@ Metadata:
           default: "AI Agent Monitoring Configuration (Optional)"
         Parameters:
           - AmazonConnectAssistantId
-          - AmazonConnectAssistantLogGroup
           - EnableAIAgentChecks
     ParameterLabels:
       AmazonConnectInstanceARN:
@@ -26,8 +25,6 @@ Metadata:
         default: "Amazon S3 bucket name"
       AmazonConnectAssistantId:
         default: "Q in Connect Assistant ID (optional)"
-      AmazonConnectAssistantLogGroup:
-        default: "AI Agent CloudWatch Log Group (optional)"
       EnableAIAgentChecks:
         default: "Enable AI Agent Checks"
         
@@ -50,11 +47,6 @@ Parameters:
   AmazonConnectAssistantId:
     Type: String
     Description: 'Q in Connect Assistant ID (leave blank to auto-discover from Connect instance). Example: 12345678-abcd-1234-efgh-123456789012'
-    Default: ''
-
-  AmazonConnectAssistantLogGroup:
-    Type: String
-    Description: 'CloudWatch Log Group for AI Agent event logs (optional - enables Phase 2 analytics checks). Example: /aws/wisdom/assistant/12345678-abcd-1234-efgh-123456789012'
     Default: ''
 
   EnableAIAgentChecks:
@@ -160,11 +152,9 @@ Resources:
           CONNECT_CW_LOG_GROUP: !Ref AmazonConnectCloudWatchLogGroup
           S3_REPORTING_BUCKET: !Ref AmazonS3ForReports
           ASSISTANT_ID: !Ref AmazonConnectAssistantId
-          ASSISTANT_LOG_GROUP_NAME: !Ref AmazonConnectAssistantLogGroup
           ENABLE_AI_CHECKS: !Ref EnableAIAgentChecks
       Code:
         ZipFile: |
-          import boto3
           import boto3
           import json
           import logging
@@ -1995,184 +1985,91 @@ Resources:
                   logger.error(f"P8 Error: {e}")
                   return html + f"<br>Error checking flow errors: {escape(str(e))}"
           
-          """Phase 2: AI Agent Log Analytics Checks (P2-P5, P10, P11, C3, C5)"""
-          def run_ai_log_insights_query(log_group, query_string, hours_back=336):
+          """S3: KMS Encryption for Connect Storage"""
+          def check_connect_storage_encryption(instance_id):
+              html = "<b>KMS Encryption for Connect Storage</b><br>"
+              logger.info(f"[S3] Starting Connect Storage Encryption check for instance_id={instance_id}")
               try:
-                  end_time = datetime.utcnow()
-                  start_time = end_time - timedelta(hours=hours_back)
-                  response = logs_client.start_query(
-                      logGroupName=log_group,
-                      startTime=int(start_time.timestamp()),
-                      endTime=int(end_time.timestamp()),
-                      queryString=query_string)
-                  query_id = response['queryId']
-                  max_attempts = 20
-                  for attempt in range(max_attempts):
-                      time.sleep(2)
-                      result = logs_client.get_query_results(queryId=query_id)
-                      if result['status'] == 'Complete':
-                          return result['results']
-                      elif result['status'] == 'Failed':
-                          logger.error(f"Log Insights query failed")
-                          return []
-                  logger.warning("Log Insights query timed out")
-                  return []
-              except Exception as e:
-                  logger.error(f"Log Insights query error: {e}")
-                  return []
-          
-          """P2: AI Agent Event Distribution"""
-          def check_ai_event_distribution(log_group):
-              html = "<b>AI Agent Event Distribution</b><br>"
-              try:
-                  query = "fields event_type | stats count() as cnt by event_type | sort cnt desc"
-                  results = run_ai_log_insights_query(log_group, query)
-                  if not results:
-                      html += "<br>No AI agent events found in the log group for this period."
-                      return html
-                  html += """<br><table style="width: 60%"><tr><th>Event Type</th><th>Count</th></tr>"""
-                  for row in results:
-                      fields = {f['field']: f['value'] for f in row}
-                      html += f"<tr><td>{escape(fields.get('event_type', 'N/A'))}</td><td>{escape(fields.get('cnt', '0'))}</td></tr>"
+                  resource_types = ['CALL_RECORDINGS', 'CHAT_TRANSCRIPTS', 'SCHEDULED_REPORTS', 'MEDIA_STREAMS', 'AGENT_EVENTS']
+                  html += """<br><table style="width: 70%"><tr><th>Storage Type</th><th>Encryption Type</th><th>KMS Key</th><th>Status</th></tr>"""
+                  has_issues = False
+                  for res_type in resource_types:
+                      try:
+                          resp = connect_client.list_instance_storage_configs(
+                              InstanceId=instance_id,
+                              ResourceType=res_type
+                          )
+                          configs = resp.get('StorageConfigs', [])
+                          if not configs:
+                              html += f'<tr><td>{escape(res_type)}</td><td>Not configured</td><td>N/A</td><td style="background-color: #CCCCCC;">N/A</td></tr>'
+                              continue
+                          for config in configs:
+                              enc = config.get('KinesisVideoStreamConfig', {}).get('EncryptionConfig', {}) or \
+                                    config.get('S3Config', {}).get('EncryptionConfig', {}) or \
+                                    config.get('KinesisStreamConfig', {}).get('EncryptionConfig', {}) or \
+                                    config.get('KinesisFirehoseConfig', {}).get('EncryptionConfig', {}) or {}
+                              enc_type = enc.get('EncryptionType', 'Not set')
+                              key_id = enc.get('KeyId', 'N/A')
+                              if enc_type == 'KMS' and key_id and not key_id.startswith('alias/aws/'):
+                                  status = 'CMK'
+                                  color = '#00FF00'
+                              elif enc_type == 'KMS':
+                                  status = 'AWS Managed'
+                                  color = '#FFA500'
+                                  has_issues = True
+                              else:
+                                  status = 'No KMS'
+                                  color = '#FFA500'
+                                  has_issues = True
+                              masked_key = (key_id[:40] + '...') if len(key_id) > 40 else key_id
+                              html += f'<tr><td>{escape(res_type)}</td><td>{escape(enc_type)}</td><td>{escape(masked_key)}</td><td style="background-color: {color};">{status}</td></tr>'
+                      except ClientError as e:
+                          if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                              html += f'<tr><td>{escape(res_type)}</td><td>Not configured</td><td>N/A</td><td style="background-color: #CCCCCC;">N/A</td></tr>'
+                          else:
+                              html += f'<tr><td>{escape(res_type)}</td><td colspan="3">Error: {escape(e.response["Error"]["Code"])}</td></tr>'
                   html += "</table>"
+                  if has_issues:
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Use customer-managed KMS keys for all storage types for full control over key rotation and access auditing.</li>
+                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/encryption-at-rest.html" target="_blank">documentation</a>.</li></ul>"""
                   return html
               except Exception as e:
-                  logger.error(f"P2 Error: {e}")
-                  return html + f"<br>Error: {escape(str(e))}"
+                  logger.error(f"S3 Error: {e}")
+                  return html + f"<br>Error checking storage encryption: {escape(str(e))}"
           
-          """P3: Tool Usage Analysis & Escalation Rate"""
-          def check_tool_usage(log_group):
-              html = "<b>AI Agent Tool Usage &amp; Escalation Rate</b><br>"
+          """Q2: Lambda Integration Limits"""
+          def check_lambda_integration_limits(instance_id):
+              html = "<b>Lambda Integration Limits</b><br>"
+              logger.info(f"[Q2] Starting Lambda Integration Limits check for instance_id={instance_id}")
               try:
-                  query = """fields @timestamp, completion
-                      | filter event_type = 'TRANSCRIPT_SELF_SERVICE_MESSAGE' and ispresent(completion)
-                      | filter completion like /toolUse/
-                      | parse completion /"name":"(?<tool_name>[^"]+)"/
-                      | stats count() as cnt by tool_name
-                      | sort cnt desc"""
-                  results = run_ai_log_insights_query(log_group, query)
-                  if not results:
-                      html += "<br>No tool usage data found."
-                      return html
-                  tool_counts = {}
-                  for row in results:
-                      fields = {f['field']: f['value'] for f in row}
-                      tool_counts[fields.get('tool_name', 'Unknown')] = int(fields.get('cnt', 0))
-                  total = sum(tool_counts.values())
-                  escalations = tool_counts.get('Escalation', 0) + tool_counts.get('ESCALATION', 0) + tool_counts.get('escalation', 0)
-                  esc_rate = round(escalations / total * 100, 1) if total > 0 else 0
-                  esc_color = "#FF0000" if esc_rate > 40 else "#FFA500" if esc_rate > 20 else "#00FF00"
-          
-                  html += f"<br>Total tool invocations: {total} | Escalation rate: <span style='background-color: {esc_color};'>{esc_rate}%</span><br><br>"
-                  html += """<table style="width: 50%"><tr><th>Tool</th><th>Count</th><th>%</th></tr>"""
-                  for tool, cnt in sorted(tool_counts.items(), key=lambda x: x[1], reverse=True):
-                      pct = round(cnt / total * 100, 1) if total > 0 else 0
-                      html += f"<tr><td>{escape(tool)}</td><td>{cnt}</td><td>{pct}%</td></tr>"
-                  html += "</table>"
-                  if esc_rate > 20:
-                      html += f"""<h4>Recommendation</h4><ul><li>Escalation rate is {esc_rate}% (target &lt;20%). Review AI agent prompts and knowledge base content to improve self-service resolution.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"P3 Error: {e}")
-                  return html + f"<br>Error: {escape(str(e))}"
-          
-          """P4: LLM Model Usage"""
-          def check_llm_model_usage(log_group):
-              html = "<b>LLM Model Usage from AI Agent Logs</b><br>"
-              try:
-                  query = "filter event_type = 'TRANSCRIPT_LARGE_LANGUAGE_MODEL_INVOCATION' | stats count(*) as invocations by model_id | sort invocations desc"
-                  results = run_ai_log_insights_query(log_group, query)
-                  if not results:
-                      html += "<br>No LLM invocation data found."
-                      return html
-                  html += """<br><table style="width: 60%"><tr><th>Model ID</th><th>Invocations</th></tr>"""
-                  for row in results:
-                      fields = {f['field']: f['value'] for f in row}
-                      html += f"<tr><td>{escape(fields.get('model_id', 'N/A'))}</td><td>{escape(fields.get('invocations', '0'))}</td></tr>"
-                  html += "</table>"
-                  return html
-              except Exception as e:
-                  logger.error(f"P4 Error: {e}")
-                  return html + f"<br>Error: {escape(str(e))}"
-          
-          """P5: Session Analytics"""
-          def check_session_analytics(log_group):
-              html = "<b>AI Agent Session Analytics</b><br>"
-              try:
-                  session_query = "filter event_type = 'TRANSCRIPT_CREATE_SESSION' | stats count() as total_sessions"
-                  session_results = run_ai_log_insights_query(log_group, session_query)
-                  total_sessions = 0
-                  if session_results:
-                      fields = {f['field']: f['value'] for f in session_results[0]}
-                      total_sessions = int(fields.get('total_sessions', 0))
-                  html += f"<br>Total sessions created: {total_sessions}<br>"
-          
-                  loop_query = "filter event_type = 'TRANSCRIPT_AGENTIC_MESSAGE' | stats count(*) as steps by session_id | sort steps desc | limit 10"
-                  loop_results = run_ai_log_insights_query(log_group, loop_query)
-                  if loop_results:
-                      html += "<br><b>Top Sessions by Agentic Loop Iterations</b><br>"
-                      html += """<table style="width: 60%"><tr><th>Session ID</th><th>Iterations</th><th>Status</th></tr>"""
-                      for row in loop_results:
-                          fields = {f['field']: f['value'] for f in row}
-                          steps = int(fields.get('steps', 0))
-                          status = "WARNING" if steps > 10 else "OK"
-                          color = "#FFA500" if steps > 10 else "#00FF00"
-                          html += f'<tr><td>{escape(fields.get("session_id", "N/A"))}</td><td>{steps}</td><td style="background-color: {color};">{status}</td></tr>'
+                  resp = connect_client.list_lambda_functions(InstanceId=instance_id, MaxResults=100)
+                  lambda_functions = resp.get('LambdaFunctions', [])
+                  total = len(lambda_functions)
+                  limit = 50
+                  pct = round(total / limit * 100, 1)
+                  color = get_color_by_percentage(pct)
+                  html += f"""<br><table style="width: 50%">
+                      <tr><th>Resource</th><th>Current</th><th>Limit</th><th>Usage %</th></tr>
+                      <tr><td>Lambda functions per instance</td><td>{total}</td><td>{limit}</td><td style="background-color: {color};">{pct}%</td></tr>
+                      </table>"""
+                  if lambda_functions:
+                      html += "<br><b>Associated Lambda Functions:</b><br>"
+                      html += """<table style="width: 80%"><tr><th>#</th><th>Lambda Function ARN</th></tr>"""
+                      for i, fn_arn in enumerate(lambda_functions, 1):
+                          html += f"<tr><td>{i}</td><td>{escape(fn_arn)}</td></tr>"
                       html += "</table>"
-                      if any(int({f['field']: f['value'] for f in r}.get('steps', 0)) > 10 for r in loop_results):
-                          html += """<h4>Recommendation</h4><ul><li>Sessions with &gt;10 agentic iterations may indicate infinite loops or poorly configured orchestration. Review agent prompts.</li></ul>"""
+                  if pct >= 80:
+                      html += """<h4>Recommendation</h4><ul>
+                          <li>Lambda function count is approaching the 50-function limit (adjustable).</li>
+                          <li>Consolidate Lambda functions using a router pattern (single function dispatching to different handlers).</li>
+                          <li>Request quota increase if needed.</li></ul>"""
                   return html
               except Exception as e:
-                  logger.error(f"P5 Error: {e}")
-                  return html + f"<br>Error: {escape(str(e))}"
+                  logger.error(f"Q2 Error: {e}")
+                  return html + f"<br>Error checking Lambda limits: {escape(str(e))}"
           
-          """P10: Recommendation Effectiveness"""
-          def check_recommendation_effectiveness(log_group):
-              html = "<b>AI Agent Recommendation Effectiveness</b><br>"
-              try:
-                  rec_query = "filter event_type = 'TRANSCRIPT_RECOMMENDATION' | stats count() as total_recs"
-                  rec_results = run_ai_log_insights_query(log_group, rec_query)
-                  total_recs = 0
-                  if rec_results:
-                      fields = {f['field']: f['value'] for f in rec_results[0]}
-                      total_recs = int(fields.get('total_recs', 0))
-          
-                  feedback_query = "filter event_type = 'TRANSCRIPT_RESULT_FEEDBACK' | stats count() as cnt by is_recommendation_useful | sort cnt desc"
-                  feedback_results = run_ai_log_insights_query(log_group, feedback_query)
-                  html += f"<br>Total recommendations delivered: {total_recs}<br>"
-                  if feedback_results:
-                      html += """<br><table style="width: 50%"><tr><th>Useful?</th><th>Count</th></tr>"""
-                      for row in feedback_results:
-                          fields = {f['field']: f['value'] for f in row}
-                          html += f"<tr><td>{escape(fields.get('is_recommendation_useful', 'N/A'))}</td><td>{escape(fields.get('cnt', '0'))}</td></tr>"
-                      html += "</table>"
-                  else:
-                      html += "<br>No recommendation feedback data found."
-                  return html
-              except Exception as e:
-                  logger.error(f"P10 Error: {e}")
-                  return html + f"<br>Error: {escape(str(e))}"
-          
-          """P11: Intent Detection Analysis"""
-          def check_intent_detection(log_group):
-              html = "<b>AI Agent Intent Detection</b><br>"
-              try:
-                  query = "filter event_type = 'TRANSCRIPT_INTENT_TRIGGERING_REFERENCE' | stats count() as cnt by intent | sort cnt desc | limit 20"
-                  results = run_ai_log_insights_query(log_group, query)
-                  if not results:
-                      html += "<br>No intent detection data found."
-                      return html
-                  html += """<br><table style="width: 60%"><tr><th>Intent</th><th>Trigger Count</th></tr>"""
-                  for row in results:
-                      fields = {f['field']: f['value'] for f in row}
-                      html += f"<tr><td>{escape(fields.get('intent', 'N/A'))}</td><td>{escape(fields.get('cnt', '0'))}</td></tr>"
-                  html += "</table>"
-                  return html
-              except Exception as e:
-                  logger.error(f"P11 Error: {e}")
-                  return html + f"<br>Error: {escape(str(e))}"
-          
-          """SEC-MCP: MCP Tool Sprawl Detection"""
+          """S4: MCP Tool Sprawl Detection"""
           def check_mcp_tool_sprawl(instance_id):
               html = "<b>MCP Tool Sprawl &amp; Unused Tool Detection</b><br>"
               logger.info(f"[SEC-MCP] Starting MCP Tool Sprawl check for instance_id={instance_id}")
@@ -2658,16 +2555,14 @@ Resources:
           
           
                   # ============================================================================
-                  # AI AGENT CHECKS - Phase 1 & Phase 2
+                  # AI AGENT CHECKS (11 Checks)
                   # ============================================================================
                   enable_ai_checks = os.environ.get('ENABLE_AI_CHECKS', 'true').lower() == 'true'
                   assistant_id = os.environ.get('ASSISTANT_ID', '').strip()
-                  assistant_log_group = os.environ.get('ASSISTANT_LOG_GROUP_NAME', '').strip()
           
                   logger.info(f"[AI-CHECKS] Config: enable_ai_checks={enable_ai_checks}, "
                               f"ASSISTANT_ID env='{os.environ.get('ASSISTANT_ID', '<not set>')}', "
-                              f"assistant_id after strip='{assistant_id}', "
-                              f"assistant_log_group='{assistant_log_group}'")
+                              f"assistant_id after strip='{assistant_id}'")
           
                   if enable_ai_checks:
                       logger.info("[AI-CHECKS] AI Agent checks ENABLED. Starting...")
@@ -2683,24 +2578,25 @@ Resources:
                       if assistant_id:
                           logger.info(f"[AI-CHECKS] Proceeding with assistant_id={assistant_id}")
           
-                          html_output += """<h2>AI Agent Overview</h2>
+                          # --- Operations Checks ---
+                          html_output += """<h2>AI Agent Operations</h2>
                               <p>Amazon Connect AI Agents (Q in Connect) provide AI-powered self-service and agent-assist capabilities.
-                              The following checks assess the configuration, security, performance, and operational health of your AI agent deployment.</p>"""
+                              The following checks assess the configuration, security, performance, resilience, and quotas of your AI agent deployment.</p>"""
           
-                          # --- C1: AI Agent Inventory ---
-                          html_output += '<div class="section"><h3>C1: AI Agent Inventory &amp; Status</h3>'
+                          # --- O1: AI Agent Inventory ---
+                          html_output += '<div class="section"><h3>O1: AI Agent Inventory &amp; Status</h3>'
                           html_output += '<p><em>Lists all AI agents configured for this assistant, their types (self-service/agent-assist), and deployment status.</em></p>'
                           html_output += check_ai_agent_inventory(assistant_id)
                           html_output += '</div>'
-                          logger.info(f"C1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          logger.info(f"O1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
-                          # --- C2: AI Prompt Configuration ---
-                          html_output += '<div class="section"><h3>C2: AI Prompt Configuration Review</h3>'
+                          # --- O2: AI Prompt Configuration ---
+                          html_output += '<div class="section"><h3>O2: AI Prompt Configuration Review</h3>'
                           html_output += '<p><em>Reviews AI prompt settings including model selection and flags expensive models that could be replaced with cost-effective alternatives.</em></p>'
                           html_output += check_ai_prompt_configuration(assistant_id)
                           html_output += '</div>'
-                          logger.info(f"C2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          logger.info(f"O2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
                           # --- Security Checks ---
@@ -2708,16 +2604,32 @@ Resources:
           
                           # --- S1: Q Guardrails ---
                           html_output += '<div class="section"><h3>S1: Q in Connect AI Guardrails</h3>'
-                          html_output += '<p><em>Verifies AI guardrails are deployed and published to protect against PII leakage, harmful content, and off-topic responses.</em></p>'
+                          html_output += '<p><em>Verifies AI guardrails are deployed with all critical filter types and checks which AI agents have guardrails associated.</em></p>'
                           html_output += check_q_guardrails(assistant_id)
                           html_output += '</div>'
                           logger.info(f"S1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
-                          # --- S4: Domain Encryption ---
-                          html_output += '<div class="section"><h3>S4: Q in Connect Domain Encryption</h3>'
+                          # --- S2: Domain Encryption ---
+                          html_output += '<div class="section"><h3>S2: Q in Connect Domain Encryption</h3>'
                           html_output += '<p><em>Checks whether a customer-managed KMS key is configured for the Q in Connect domain for encryption control and auditability.</em></p>'
                           html_output += check_q_domain_encryption(assistant_id)
+                          html_output += '</div>'
+                          logger.info(f"S2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+          
+                          # --- S3: Connect Storage Encryption ---
+                          html_output += '<div class="section"><h3>S3: KMS Encryption for Connect Storage</h3>'
+                          html_output += '<p><em>Checks KMS encryption configuration for call recordings, chat transcripts, and other Connect storage types.</em></p>'
+                          html_output += check_connect_storage_encryption(instance_id)
+                          html_output += '</div>'
+                          logger.info(f"S3 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
+          
+                          # --- S4: MCP Tool Sprawl ---
+                          html_output += '<div class="section"><h3>S4: MCP Tool Sprawl Detection</h3>'
+                          html_output += '<p><em>Detects excessive MCP tool permissions on security profiles that increase AI agent inference latency.</em></p>'
+                          html_output += check_mcp_tool_sprawl(instance_id)
                           html_output += '</div>'
                           logger.info(f"S4 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
@@ -2733,96 +2645,43 @@ Resources:
                           logger.info(f"P1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
-                          # --- P8: Flow Errors ---
-                          html_output += '<div class="section"><h3>P8: Contact Flow Errors</h3>'
+                          # --- P2: Flow Errors ---
+                          html_output += '<div class="section"><h3>P2: Contact Flow Errors</h3>'
                           html_output += '<p><em>Monitors ContactFlowErrors and ContactFlowFatalErrors from CloudWatch to detect flow execution failures.</em></p>'
                           html_output += check_flow_errors(instance_id, days_back)
                           html_output += '</div>'
-                          logger.info(f"P8 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-          
-                          # --- SEC-MCP: MCP Tool Sprawl Detection ---
-                          html_output += '<div class="section"><h3>SEC-MCP: MCP Tool Sprawl Detection</h3>'
-                          html_output += '<p><em>Detects excessive MCP tool permissions on security profiles that increase AI agent inference latency.</em></p>'
-                          html_output += check_mcp_tool_sprawl(instance_id)
-                          html_output += '</div>'
-                          logger.info(f"SEC-MCP completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          logger.info(f"P2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
                           # --- Resilience Checks ---
                           html_output += """<h2>AI Agent Resilience</h2>"""
           
-                          # --- R3: KB Sync Health ---
-                          html_output += '<div class="section"><h3>R3: Knowledge Base Sync Health</h3>'
+                          # --- R1: KB Sync Health ---
+                          html_output += '<div class="section"><h3>R1: Knowledge Base Sync Health</h3>'
                           html_output += '<p><em>Checks knowledge base associations and content freshness — flags stale KBs not synced in over 24 hours.</em></p>'
                           html_output += check_kb_sync_health(assistant_id)
                           html_output += '</div>'
-                          logger.info(f"R3 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          logger.info(f"R1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
                           # --- Service Quotas ---
                           html_output += """<h2>AI Agent Service Quotas</h2>"""
           
-                          # --- Q2: Q Hard Limits ---
-                          html_output += '<div class="section"><h3>Q2: Q in Connect Service Limits</h3>'
+                          # --- Q1: Q Hard Limits ---
+                          html_output += '<div class="section"><h3>Q1: Q in Connect Service Limits</h3>'
                           html_output += '<p><em>Checks current usage against non-adjustable Q in Connect limits: assistants, knowledge bases, articles, and instance associations.</em></p>'
                           html_output += check_q_hard_limits(assistant_id)
                           html_output += '</div>'
-                          logger.info(f"Q2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          logger.info(f"Q1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
-                          # ============================================================
-                          # Phase 2: Log Analytics (only if log group is configured)
-                          # ============================================================
-                          if assistant_log_group:
-                              logger.info(f"Phase 2: Log analytics with log group: {assistant_log_group}")
-                              html_output += """<h2>AI Agent Analytics (Log-Based)</h2>
-                                  <p>Analyzing AI Agent event logs from CloudWatch for operational insights.</p>"""
-          
-                              html_output += '<div class="section"><h3>P2: Event Distribution</h3>'
-                              html_output += '<p><em>Analyzes AI agent event types from CloudWatch Logs to show activity breakdown across sessions, LLM calls, and recommendations.</em></p>'
-                              html_output += check_ai_event_distribution(assistant_log_group)
-                              html_output += '</div>'
-                              logger.info(f"P2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                              lambda_exec_intermediate_time = time.time()
-          
-                              html_output += '<div class="section"><h3>P3: Tool Usage &amp; Escalation Rate</h3>'
-                              html_output += '<p><em>Tracks which tools AI agents invoke (Retrieve, Escalation, Complete) and calculates the escalation rate — target below 20%.</em></p>'
-                              html_output += check_tool_usage(assistant_log_group)
-                              html_output += '</div>'
-                              logger.info(f"P3 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                              lambda_exec_intermediate_time = time.time()
-          
-                              html_output += '<div class="section"><h3>P4: LLM Model Usage</h3>'
-                              html_output += '<p><em>Shows which foundation models are being invoked by AI agents and how frequently — useful for cost and performance analysis.</em></p>'
-                              html_output += check_llm_model_usage(assistant_log_group)
-                              html_output += '</div>'
-                              logger.info(f"P4 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                              lambda_exec_intermediate_time = time.time()
-          
-                              html_output += '<div class="section"><h3>P5: Session Analytics</h3>'
-                              html_output += '<p><em>Monitors session creation volume and agentic loop iterations — flags sessions with excessive iterations that may indicate infinite loops.</em></p>'
-                              html_output += check_session_analytics(assistant_log_group)
-                              html_output += '</div>'
-                              logger.info(f"P5 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                              lambda_exec_intermediate_time = time.time()
-          
-                              html_output += '<div class="section"><h3>P10: Recommendation Effectiveness</h3>'
-                              html_output += '<p><em>Tracks how many AI recommendations were delivered to agents and whether they were marked as useful — measures agent-assist ROI.</em></p>'
-                              html_output += check_recommendation_effectiveness(assistant_log_group)
-                              html_output += '</div>'
-                              logger.info(f"P10 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                              lambda_exec_intermediate_time = time.time()
-          
-                              html_output += '<div class="section"><h3>P11: Intent Detection</h3>'
-                              html_output += '<p><em>Analyzes which customer intents are being detected and their frequency — helps tune intent configuration and coverage.</em></p>'
-                              html_output += check_intent_detection(assistant_log_group)
-                              html_output += '</div>'
-                              logger.info(f"P11 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                              lambda_exec_intermediate_time = time.time()
-                          else:
-                              html_output += """<h2>AI Agent Analytics (Log-Based)</h2>
-                                  <p>Phase 2 log analytics checks are disabled. Set <code>ASSISTANT_LOG_GROUP_NAME</code> env var to enable.</p>"""
+                          # --- Q2: Lambda Integration Limits ---
+                          html_output += '<div class="section"><h3>Q2: Lambda Integration Limits</h3>'
+                          html_output += '<p><em>Counts Lambda functions associated with the Connect instance against the 50-function limit.</em></p>'
+                          html_output += check_lambda_integration_limits(instance_id)
+                          html_output += '</div>'
+                          logger.info(f"Q2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
+                          lambda_exec_intermediate_time = time.time()
           
                           logger.info("AI Agent checks completed.")
                       else:
