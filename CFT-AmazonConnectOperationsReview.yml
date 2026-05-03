@@ -14,12 +14,6 @@ Metadata:
           - AmazonConnectInstanceARN
           - AmazonConnectCloudWatchLogGroup
           - AmazonS3ForReports
-      - Label:
-          default: "AI Agent Monitoring Configuration (Optional)"
-        Parameters:
-          - AmazonConnectAssistantId
-          - EnableAIAgentChecks
-          - Boto3LayerArn
     ParameterLabels:
       AmazonConnectInstanceARN:
         default: "Amazon Connnect Instance ARN"
@@ -27,12 +21,6 @@ Metadata:
         default: "Amazon Connect CloudWatch LogGroup"
       AmazonS3ForReports:
         default: "Amazon S3 bucket name"
-      AmazonConnectAssistantId:
-        default: "Q in Connect Assistant ID (optional)"
-      EnableAIAgentChecks:
-        default: "Enable AI Agent Checks"
-      Boto3LayerArn:
-        default: "Boto3 Lambda Layer ARN (leave blank to auto-create)"
         
 Parameters:
   AmazonConnectInstanceARN:
@@ -50,35 +38,11 @@ Parameters:
     MaxLength: 63
     ConstraintDescription: 'Must be a valid S3 bucket name'
 
-  AmazonConnectAssistantId:
-    Type: String
-    Description: 'Q in Connect Assistant ID (leave blank to auto-discover from Connect instance). Example: 12345678-abcd-1234-efgh-123456789012'
-    Default: ''
-
-  EnableAIAgentChecks:
-    Type: String
-    Description: 'Enable AI Agent monitoring checks (requires Q in Connect / Amazon Connect AI Agents)'
-    Default: 'true'
-    AllowedValues:
-      - 'true'
-      - 'false'
-
-  Boto3LayerArn:
-    Type: String
-    Description: 'ARN of a Lambda Layer with updated boto3 (>=1.42.0). Required for AI Agent checks — the default Lambda runtime boto3 does not support Q in Connect AI Agent configuration APIs. Leave blank to create one automatically.'
-    Default: ''
-
-Conditions:
-  HasBoto3Layer: !Not [!Equals [!Ref Boto3LayerArn, '']]
-  CreateBoto3Layer: !Equals [!Ref Boto3LayerArn, '']
-
 Resources:
-  # Boto3 Lambda Layer — created automatically if Boto3LayerArn is not provided
-  # The default Lambda runtime boto3 (1.40.x) returns SDK_UNKNOWN_MEMBER for
-  # orchestrationAIAgentConfiguration, breaking all AI Agent checks.
+  # Boto3 Lambda Layer — auto-created to provide updated boto3 for Q in Connect AI Agent APIs
+  # The default Lambda runtime boto3 (1.40.x) does not support orchestrationAIAgentConfiguration
   Boto3LayerBuilder:
     Type: AWS::Lambda::Function
-    Condition: CreateBoto3Layer
     Properties:
       FunctionName: !Sub '${AWS::StackName}-boto3-layer-builder'
       Description: 'Builds a boto3 Lambda Layer for Q in Connect API support'
@@ -128,7 +92,6 @@ Resources:
 
   Boto3LayerCustomResource:
     Type: AWS::CloudFormation::CustomResource
-    Condition: CreateBoto3Layer
     Properties:
       ServiceToken: !GetAtt Boto3LayerBuilder.Arn
 
@@ -232,20 +195,15 @@ Resources:
       Runtime: python3.13
       Timeout: 900
       MemorySize: 1024
-      Layers: !If
-        - HasBoto3Layer
-        - - !Ref Boto3LayerArn
-        - !If
-          - CreateBoto3Layer
-          - - !GetAtt Boto3LayerCustomResource.LayerVersionArn
-          - !Ref 'AWS::NoValue'
+      Layers:
+        - !GetAtt Boto3LayerCustomResource.LayerVersionArn
       Environment:
         Variables:
           CONNECT_INSTANCE_ARN: !Ref AmazonConnectInstanceARN
           CONNECT_CW_LOG_GROUP: !Ref AmazonConnectCloudWatchLogGroup
           S3_REPORTING_BUCKET: !Ref AmazonS3ForReports
-          ASSISTANT_ID: !Ref AmazonConnectAssistantId
-          ENABLE_AI_CHECKS: !Ref EnableAIAgentChecks
+          ASSISTANT_ID: ''
+          ENABLE_AI_CHECKS: 'true'
       Code:
         ZipFile: |
           import boto3
