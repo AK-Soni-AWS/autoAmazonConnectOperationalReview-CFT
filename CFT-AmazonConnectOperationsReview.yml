@@ -362,109 +362,6 @@ Resources:
               else:
                   return "#00FF00"  # Green - Normal
           
-          """Get Current utilization for Amazon Connect"""
-          def old_current_utilization (instance_id, metric_name):
-          
-              try:
-                  matched_value = metric_name
-                  if matched_value == "ContactFlows":
-                      # List all contact flows
-                          response = connect_client.list_contact_flows(InstanceId=instance_id)
-                          metric_usage = len(response['ContactFlowSummaryList'])
-          
-                  # Get the current number of Users
-                  elif matched_value == "Users":
-                      # List all users
-                          response = connect_client.list_users(InstanceId=instance_id)
-                          metric_usage = len(response['UserSummaryList'])
-          
-                  # Get the current number of Queues
-                  elif matched_value == "Queues":
-                      # List all queues
-                          response = connect_client.list_queues(InstanceId=instance_id)
-                          metric_usage = len(response['QueueSummaryList'])
-          
-                  elif matched_value == "RoutingProfiles":
-                      # List all routing profiles
-                          response = connect_client.list_routing_profiles(InstanceId=instance_id)
-                          metric_usage = len(response['RoutingProfileSummaryList'])
-          
-                  elif matched_value == "SecurityProfiles":
-                      # List all security profiles
-                          response = connect_client.list_security_profiles(InstanceId=instance_id)
-                          metric_usage = len(response['SecurityProfileSummaryList'])
-          
-                  elif matched_value == "HoursOfOperation":
-                      # List all hours of operation
-                          response = connect_client.list_hours_of_operations(InstanceId=instance_id)
-                          metric_usage = len(response['HoursOfOperationSummaryList'])
-          
-                  elif matched_value == "Prompts":
-                      # List all prompts
-                          response = connect_client.list_prompts(InstanceId=instance_id)
-                          metric_usage = len(response['PromptSummaryList'])
-          
-                  elif matched_value == "LexBotsV1":
-                      # List all lex bots
-                          response = connect_client.list_bots(InstanceId=instance_id, LexVersion='V1')
-                          metric_usage = len(response['LexBots'])
-          
-                  elif matched_value == "LexBotsV2":
-                      # List all lex bots
-                          response = connect_client.list_bots(InstanceId=instance_id, LexVersion='V2')
-                          metric_usage = len(response['LexBots'])
-          
-                  elif matched_value == "PhoneNumbers":
-                      # List all phone numbers
-                          response = connect_client.list_phone_numbers(InstanceId=instance_id)
-                          metric_usage = len(response['PhoneNumberSummaryList'])
-          
-                  elif matched_value == "AgentStatuses":
-                      # List all agent statuses
-                          response = connect_client.list_agent_statuses(InstanceId=instance_id)
-                          metric_usage = len(response['AgentStatusSummaryList'])
-          
-                  elif matched_value == "ContactFlowModules":
-                      # List all contact flow modules
-                          response = connect_client.list_contact_flow_modules(InstanceId=instance_id)
-                          metric_usage = len(response['ContactFlowModulesSummaryList'])
-          
-                  elif matched_value == "QuickConnects":
-                      # List all quick connects
-                          response = connect_client.list_quick_connects(InstanceId=instance_id)
-                          metric_usage = len(response['QuickConnectSummaryList'])
-          
-                  else:
-                  # Handle unexpected metric_name values
-                      error = f"Unknown metric name: {metric_name}"
-                      logger.warning(error)
-                      return error
-          
-                  logger.debug(f"Metric {matched_value} usage : {metric_usage}")
-          
-                  return metric_usage
-          
-              except Exception as e:
-                  logger.error(f"AWS Client Error: {e}")
-                  #print(traceback.format_exc())
-                  return {
-                      'statusCode': 500,
-                      'body': json.dumps({
-                          'error': 'AWS API Error',
-                          'message': str(e)
-                      })
-                  }
-          
-              except Exception as e:
-                  logger.error(f"Unexpected error: {e}")
-                  return {
-                      'statusCode': 500,
-                      'body': json.dumps({
-                          'error': 'Internal server error',
-                          'message': str(e)
-                      })
-                  }
-          
           def count_paginated(client, method: str, list_key: str, **kwargs) -> int:
               """Generic paginator counter for any Connect list_* API."""
               total = 0
@@ -2633,15 +2530,15 @@ Resources:
           """R3: Knowledge Base Association & Sync Health"""
           def check_kb_sync_health(assistant_id):
               html = "<b>Knowledge Base Sync Health</b><br>"
-              logger.info(f"[R3] Starting KB Sync Health check for assistant_id={assistant_id}")
+              logger.info(f"[R1] Starting KB Sync Health check for assistant_id={assistant_id}")
               try:
                   assoc_resp = qconnect_client.list_assistant_associations(assistantId=assistant_id, maxResults=100)
                   all_associations = assoc_resp.get('assistantAssociationSummaries', [])
-                  logger.info(f"[R3] list_assistant_associations returned {len(all_associations)} total association(s)")
+                  logger.info(f"[R1] list_assistant_associations returned {len(all_associations)} total association(s)")
                   for a in all_associations:
-                      logger.info(f"[R3] Association: type={a.get('associationType')}, id={a.get('assistantAssociationId')}")
+                      logger.info(f"[R1] Association: type={a.get('associationType')}, id={a.get('assistantAssociationId')}")
                   kb_associations = [a for a in all_associations if a.get('associationType') == 'KNOWLEDGE_BASE']
-                  logger.info(f"[R3] Found {len(kb_associations)} KNOWLEDGE_BASE association(s)")
+                  logger.info(f"[R1] Found {len(kb_associations)} KNOWLEDGE_BASE association(s)")
           
                   if not kb_associations:
                       html += "<br>No knowledge bases associated with this assistant."
@@ -2649,8 +2546,8 @@ Resources:
                       return html
           
                   html += f"<br>Found {len(kb_associations)} knowledge base association(s).<br><br>"
-                  html += """<table style="width: 80%"><tr><th>KB Name</th><th>KB ID</th><th>Status</th><th>Last Content Modified</th><th>Hours Since Sync</th><th>Health</th></tr>"""
-                  stale_kbs = []
+                  html += """<table style="width: 90%"><tr><th>KB Name</th><th>KB ID</th><th>Status</th><th>Last Content Modified</th><th>Time Since Last Update</th><th>Freshness</th></tr>"""
+                  review_kbs = []
                   for assoc in kb_associations:
                       kb_id = assoc.get('associationData', {}).get('knowledgeBaseAssociation', {}).get('knowledgeBaseId', '')
                       if not kb_id:
@@ -2663,30 +2560,46 @@ Resources:
                           last_modified = kb.get('lastContentModificationTime')
                           if last_modified:
                               hours_since = (datetime.now(timezone.utc) - last_modified).total_seconds() / 3600
-                              hours_str = f"{hours_since:.1f}"
-                              health = "STALE" if hours_since > 24 else "HEALTHY"
-                              if hours_since > 24:
-                                  stale_kbs.append(kb_name)
-                              color = "#FF0000" if hours_since > 24 else "#00FF00"
+                              days_since = hours_since / 24
+                              if days_since >= 1:
+                                  time_str = f"{days_since:.1f} days"
+                              else:
+                                  time_str = f"{hours_since:.1f} hours"
+                              # Freshness is informational, not a hard pass/fail
+                              if hours_since <= 24:
+                                  freshness = "Recent"
+                                  color = "#00FF00"
+                              elif hours_since <= 168:
+                                  freshness = "Review"
+                                  color = "#FFA500"
+                                  review_kbs.append(kb_name)
+                              else:
+                                  freshness = "Review"
+                                  color = "#FFA500"
+                                  review_kbs.append(kb_name)
                               last_mod_str = last_modified.strftime("%Y-%m-%d %H:%M UTC")
                           else:
-                              hours_str = "Unknown"
-                              health = "UNKNOWN"
+                              time_str = "Unknown"
+                              freshness = "Unknown"
                               color = "#FFA500"
                               last_mod_str = "Never"
-                          html += f'<tr><td>{kb_name}</td><td>{escape(kb_id)}</td><td>{kb_status}</td><td>{last_mod_str}</td><td>{hours_str}</td><td style="background-color: {color};">{health}</td></tr>'
+                              review_kbs.append(kb_name)
+                          html += f'<tr><td>{kb_name}</td><td>{escape(kb_id)}</td><td>{kb_status}</td><td>{last_mod_str}</td><td>{time_str}</td><td style="background-color: {color};">{freshness}</td></tr>'
                       except Exception as kb_err:
                           html += f'<tr><td>N/A</td><td>{escape(kb_id)}</td><td>ERROR</td><td>N/A</td><td>N/A</td><td style="background-color: #FFA500;">ERROR</td></tr>'
                           logger.warning(f"Error getting KB {kb_id}: {kb_err}")
                   html += "</table>"
-                  if stale_kbs:
+                  html += """<p><em>Note: The required sync frequency depends on how often your source content changes.
+                      Verify that the last content modification time aligns with your expected update schedule.
+                      If source content has changed but the knowledge base has not been updated, check your sync configuration.</em></p>"""
+                  if review_kbs:
                       html += f"""<h4>Recommendation</h4><ul>
-                          <li>Knowledge base(s) with stale data (&gt;24h since last sync): {', '.join(stale_kbs)}</li>
-                          <li>Check sync configuration (default: 1 hour). For S3 sources, verify S3 event triggers.</li>
-                          <li>Set CloudWatch alarm on <code>RecordsFailed &gt; 0</code> in <code>AWS/AppIntegrations</code> namespace.</li></ul>"""
+                          <li>Knowledge base(s) to review: {', '.join(review_kbs)}. Verify content is up to date with your source.</li>
+                          <li>Default sync interval is 1 hour. Options: every 1 hour, every 3 hours, or daily. For S3 sources, sync is triggered by S3 object events.</li>
+                          <li>Consider setting a CloudWatch alarm on <code>RecordsFailed &gt; 0</code> in <code>AWS/AppIntegrations</code> namespace to detect sync failures.</li></ul>"""
                   return html
               except Exception as e:
-                  logger.error(f"R3 Error: {e}")
+                  logger.error(f"R1 Error: {e}")
                   return html + f"<br>Error checking KB sync health: {escape(str(e))}"
           
           """P8: Connect Contact Flow Errors"""
@@ -4244,7 +4157,7 @@ Resources:
                           <tr><th>Pillar</th><th>Check</th><th>Status</th><th>Detail</th></tr>"""
 
                   # Sort checks by pillar order (matching HTML), then by status severity within each pillar
-                  pillar_order = ["Security", "Resilience", "Operational Excellence", "Capacity Analysis", "Observability", "Cost", "AI Agent"]
+                  pillar_order = ["Security", "Resilience", "Operational Excellence", "Capacity Analysis", "Observability", "Cost"]
                   status_order = {"fail": 0, "warn": 1, "info": 2, "pass": 3}
                   # Fixed order for Capacity Analysis checks
                   capacity_check_order = [
@@ -4321,119 +4234,135 @@ Resources:
                       if assistant_id:
                           logger.info(f"[AI-CHECKS] Proceeding with assistant_id={assistant_id}")
           
-                          # --- Operations Checks ---
-                          html_output += """<h2>AI Agent Operations</h2>
-                              <p>Amazon Connect AI Agents (Q in Connect) provide AI-powered self-service and agent-assist capabilities.
-                              The following checks assess the configuration, security, performance, resilience, and quotas of your AI agent deployment.</p>"""
-          
+                          # --- AI Agent Checks (integrated into existing pillars) ---
+                          html_output += """<h2>AI Agent</h2>
+                              <p>Amazon Connect AI Agents (Q in Connect) provide AI-powered self-service and agent-assist capabilities.</p>"""
+
+                          # Helper to determine check status from HTML output
+                          def _ai_status(html_result, warn_keywords=None, fail_keywords=None):
+                              warn_keywords = warn_keywords or ['WARNING', 'color: #FFA500', 'color: red', 'CRITICAL', 'missing', 'Missing', 'No guardrail', 'No CloudWatch', 'No KMS', 'Review']
+                              fail_keywords = fail_keywords or ['CRITICAL', 'color: red']
+                              for kw in fail_keywords:
+                                  if kw in html_result:
+                                      return 'fail'
+                              for kw in warn_keywords:
+                                  if kw in html_result:
+                                      return 'warn'
+                              return 'pass'
+
                           # --- O1: AI Agent Inventory ---
-                          html_output += '<div class="section"><h3>O1: AI Agent Inventory &amp; Status</h3>'
+                          html_output += '<div class="section" id="ai-o1"><h3>AI Agent Inventory &amp; Status</h3>'
                           html_output += '<p><em>Lists all AI agents configured for this assistant, their types (self-service/agent-assist), and deployment status.</em></p>'
-                          html_output += check_ai_agent_inventory(assistant_id, instance_id)
+                          _o1_html = check_ai_agent_inventory(assistant_id, instance_id)
+                          html_output += _o1_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "O1: AI Agent Inventory", "status": "info", "detail": "Agent inventory collected", "anchor": "ai-o1"})
+                          checks.append({"pillar": "Operational Excellence", "check": "AI Agent Inventory", "status": _ai_status(_o1_html, warn_keywords=['No AI agents']), "detail": "Agent inventory collected", "anchor": "ai-o1"})
                           logger.info(f"O1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
+
                           # --- O2: AI Prompt Configuration ---
-                          html_output += '<div class="section"><h3>O2: AI Prompt Configuration Review</h3>'
-                          html_output += '<p><em>Reviews AI prompt model selection — model choice affects response latency and quality, not cost (Connect bills flat rate per message).</em></p>'
-                          html_output += check_ai_prompt_configuration(assistant_id)
+                          html_output += '<div class="section" id="ai-o2"><h3>AI Prompt Configuration</h3>'
+                          html_output += '<p><em>Reviews AI prompt model selection. Model choice affects response latency and quality, not cost (Connect bills flat rate per message).</em></p>'
+                          _o2_html = check_ai_prompt_configuration(assistant_id)
+                          html_output += _o2_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "O2: AI Prompt Configuration", "status": "info", "detail": "Prompt model selection reviewed", "anchor": "ai-o2"})
+                          checks.append({"pillar": "Operational Excellence", "check": "AI Prompt Configuration", "status": _ai_status(_o2_html, warn_keywords=['Higher latency']), "detail": "Prompt model selection reviewed", "anchor": "ai-o2"})
                           logger.info(f"O2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
-                          # --- Security Checks ---
-                          html_output += """<h2>AI Agent Security</h2>"""
-          
+
                           # --- S1: Q Guardrails ---
-                          html_output += '<div class="section"><h3>S1: Q in Connect AI Guardrails</h3>'
+                          html_output += '<div class="section" id="ai-s1"><h3>AI Guardrails</h3>'
                           html_output += '<p><em>Verifies AI guardrails are deployed with all critical filter types and checks which AI agents have guardrails associated.</em></p>'
-                          html_output += check_q_guardrails(assistant_id)
+                          _s1_html = check_q_guardrails(assistant_id)
+                          html_output += _s1_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "S1: AI Guardrails", "status": "info", "detail": "Guardrail filter coverage and agent association analyzed", "anchor": "ai-s1"})
+                          _s1_status = 'fail' if 'No published AI guardrails' in _s1_html or 'No guardrail' in _s1_html else _ai_status(_s1_html)
+                          checks.append({"pillar": "Security", "check": "AI Guardrails", "status": _s1_status, "detail": "Guardrail filter coverage and agent association analyzed", "anchor": "ai-s1"})
                           logger.info(f"S1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
+
                           # --- S2: Domain Encryption ---
-                          html_output += '<div class="section"><h3>S2: Q in Connect Domain Encryption</h3>'
-                          html_output += '<p><em>Checks whether a customer-managed KMS key is configured for the Q in Connect domain for encryption control and auditability.</em></p>'
-                          html_output += check_q_domain_encryption(assistant_id)
+                          html_output += '<div class="section" id="ai-s2"><h3>Q in Connect Domain Encryption</h3>'
+                          html_output += '<p><em>Checks whether a customer-managed KMS key is configured for the Q in Connect domain.</em></p>'
+                          _s2_html = check_q_domain_encryption(assistant_id)
+                          html_output += _s2_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "S2: Domain Encryption", "status": "info", "detail": "Q in Connect encryption configuration checked", "anchor": "ai-s2"})
+                          _s2_status = 'pass' if 'Customer-managed KMS' in _s2_html else 'warn'
+                          checks.append({"pillar": "Security", "check": "Q in Connect Domain Encryption", "status": _s2_status, "detail": "CMK configured" if _s2_status == 'pass' else "Using AWS-owned key", "anchor": "ai-s2"})
                           logger.info(f"S2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
+
                           # --- S3: Connect Storage Encryption ---
-                          html_output += '<div class="section"><h3>S3: KMS Encryption for Connect Storage</h3>'
-                          html_output += '<p><em>Checks KMS encryption configuration for call recordings, chat transcripts, and other Connect storage types.</em></p>'
-                          html_output += check_connect_storage_encryption(instance_id)
+                          html_output += '<div class="section" id="ai-s3"><h3>Connect Storage Encryption</h3>'
+                          html_output += '<p><em>Checks KMS encryption for call recordings, chat transcripts, and other Connect storage types.</em></p>'
+                          _s3_html = check_connect_storage_encryption(instance_id)
+                          html_output += _s3_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "S3: Storage Encryption", "status": "info", "detail": "Connect storage KMS encryption checked", "anchor": "ai-s3"})
+                          checks.append({"pillar": "Security", "check": "Connect Storage Encryption", "status": _ai_status(_s3_html, warn_keywords=['No KMS', 'AWS Managed']), "detail": "Storage KMS encryption checked", "anchor": "ai-s3"})
                           logger.info(f"S3 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
+
                           # --- S4: MCP Tool Sprawl ---
-                          html_output += '<div class="section"><h3>S4: MCP Tool Sprawl Detection</h3>'
+                          html_output += '<div class="section" id="ai-s4"><h3>MCP Tool Sprawl Detection</h3>'
                           html_output += '<p><em>Detects excessive MCP tool permissions on security profiles that increase AI agent inference latency.</em></p>'
-                          html_output += check_mcp_tool_sprawl(instance_id)
+                          _s4_html = check_mcp_tool_sprawl(instance_id)
+                          html_output += _s4_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "S4: MCP Tool Sprawl", "status": "info", "detail": "Security profile MCP tool counts analyzed", "anchor": "ai-s4"})
+                          _s4_status = 'fail' if 'CRITICAL' in _s4_html else _ai_status(_s4_html)
+                          checks.append({"pillar": "Security", "check": "MCP Tool Sprawl", "status": _s4_status, "detail": "Security profile MCP tool counts analyzed", "anchor": "ai-s4"})
                           logger.info(f"S4 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
-                          # --- Performance Checks ---
-                          html_output += """<h2>AI Agent Performance</h2>"""
-          
+
                           # --- P1: AI Agent Logging ---
-                          html_output += '<div class="section"><h3>P1: AI Agent Logging &amp; Observability</h3>'
-                          html_output += '<p><em>Checks if CloudWatch event log delivery is configured for the AI assistant — required for all log-based analytics.</em></p>'
-                          html_output += check_ai_agent_logging(assistant_id, account_id, aws_region)
+                          html_output += '<div class="section" id="ai-p1"><h3>AI Agent Logging &amp; Observability</h3>'
+                          html_output += '<p><em>Checks if CloudWatch event log delivery is configured for the AI assistant.</em></p>'
+                          _p1_html = check_ai_agent_logging(assistant_id, account_id, aws_region)
+                          html_output += _p1_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "P1: AI Agent Logging", "status": "info", "detail": "CloudWatch Vended Logs delivery checked", "anchor": "ai-p1"})
+                          _p1_status = 'pass' if 'log delivery configured' in _p1_html else 'warn'
+                          checks.append({"pillar": "Observability", "check": "AI Agent Logging", "status": _p1_status, "detail": "Log delivery configured" if _p1_status == 'pass' else "No Vended Logs delivery found", "anchor": "ai-p1"})
                           logger.info(f"P1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
+
                           # --- P2: Flow Errors ---
-                          html_output += '<div class="section"><h3>P2: Contact Flow Errors</h3>'
-                          html_output += '<p><em>Monitors ContactFlowErrors and ContactFlowFatalErrors from CloudWatch to detect flow execution failures.</em></p>'
-                          html_output += check_flow_errors(instance_id, days_back)
+                          html_output += '<div class="section" id="ai-p2"><h3>Contact Flow Errors (AI)</h3>'
+                          html_output += '<p><em>Monitors ContactFlowErrors and ContactFlowFatalErrors from CloudWatch.</em></p>'
+                          _p2_html = check_flow_errors(instance_id, days_back)
+                          html_output += _p2_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "P2: Contact Flow Errors", "status": "info", "detail": "Flow error metrics analyzed", "anchor": "ai-p2"})
+                          _p2_status = 'fail' if 'CRITICAL' in _p2_html else ('warn' if 'WARNING' in _p2_html else 'pass')
+                          checks.append({"pillar": "Observability", "check": "Contact Flow Errors (AI)", "status": _p2_status, "detail": "Flow error metrics analyzed", "anchor": "ai-p2"})
                           logger.info(f"P2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
-                          # --- Resilience Checks ---
-                          html_output += """<h2>AI Agent Resilience</h2>"""
-          
+
                           # --- R1: KB Sync Health ---
-                          html_output += '<div class="section"><h3>R1: Knowledge Base Sync Health</h3>'
-                          html_output += '<p><em>Checks knowledge base associations and content freshness — flags stale KBs not synced in over 24 hours.</em></p>'
-                          html_output += check_kb_sync_health(assistant_id)
+                          html_output += '<div class="section" id="ai-r1"><h3>Knowledge Base Sync Health</h3>'
+                          html_output += '<p><em>Checks knowledge base associations and content freshness.</em></p>'
+                          _r1_html = check_kb_sync_health(assistant_id)
+                          html_output += _r1_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "R1: KB Sync Health", "status": "info", "detail": "Knowledge base freshness checked", "anchor": "ai-r1"})
+                          _r1_status = 'warn' if 'Review' in _r1_html and 'to review' in _r1_html else 'pass'
+                          checks.append({"pillar": "Resilience", "check": "Knowledge Base Sync Health", "status": _r1_status, "detail": "Knowledge base freshness checked", "anchor": "ai-r1"})
                           logger.info(f"R1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
-                          # --- Service Quotas ---
-                          html_output += """<h2>AI Agent Service Quotas</h2>"""
-          
+
                           # --- Q1: Q Hard Limits ---
-                          html_output += '<div class="section"><h3>Q1: Q in Connect Service Limits</h3>'
-                          html_output += '<p><em>Checks current usage against non-adjustable Q in Connect limits: assistants, knowledge bases, articles, and instance associations.</em></p>'
-                          html_output += check_q_hard_limits(assistant_id)
+                          html_output += '<div class="section" id="ai-q1"><h3>Q in Connect Service Limits</h3>'
+                          html_output += '<p><em>Checks usage against non-adjustable Q in Connect limits.</em></p>'
+                          _q1_html = check_q_hard_limits(assistant_id)
+                          html_output += _q1_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "Q1: Q in Connect Limits", "status": "info", "detail": "Service limits and article counts checked", "anchor": "ai-q1"})
+                          checks.append({"pillar": "Capacity Analysis", "check": "Q in Connect Limits", "status": _ai_status(_q1_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Service limits and article counts checked", "anchor": "ai-q1"})
                           logger.info(f"Q1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
-          
+
                           # --- Q2: Lambda Integration Limits ---
-                          html_output += '<div class="section"><h3>Q2: Lambda Integration Limits</h3>'
+                          html_output += '<div class="section" id="ai-q2"><h3>Lambda Integration Limits</h3>'
                           html_output += '<p><em>Counts Lambda functions associated with the Connect instance against the 50-function limit.</em></p>'
-                          html_output += check_lambda_integration_limits(instance_id)
+                          _q2_html = check_lambda_integration_limits(instance_id)
+                          html_output += _q2_html
                           html_output += '</div>'
-                          checks.append({"pillar": "AI Agent", "check": "Q2: Lambda Integration Limits", "status": "info", "detail": "Lambda function count vs 50-function limit", "anchor": "ai-q2"})
+                          checks.append({"pillar": "Capacity Analysis", "check": "Lambda Integration Limits", "status": _ai_status(_q2_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Lambda function count vs 50-function limit", "anchor": "ai-q2"})
                           logger.info(f"Q2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
                           lambda_exec_intermediate_time = time.time()
           
