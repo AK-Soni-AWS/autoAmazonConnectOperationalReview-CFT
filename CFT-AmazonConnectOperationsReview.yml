@@ -1249,6 +1249,52 @@ Resources:
                           .back-to-top:hover {{
                               background: var(--aws-orange);
                           }}
+                          /* Collapsible sections */
+                          .section-header {{
+                              display: flex;
+                              align-items: center;
+                              cursor: pointer;
+                              user-select: none;
+                          }}
+                          .section-header:hover {{
+                              opacity: 0.8;
+                          }}
+                          .toggle-arrow {{
+                              display: inline-block;
+                              width: 20px;
+                              font-size: 0.8rem;
+                              color: var(--text-light);
+                              transition: transform 0.2s;
+                              flex-shrink: 0;
+                          }}
+                          .toggle-arrow.collapsed {{
+                              transform: rotate(-90deg);
+                          }}
+                          .section-body {{
+                              transition: max-height 0.3s ease;
+                              overflow: hidden;
+                          }}
+                          .section-body.collapsed {{
+                              display: none;
+                          }}
+                          .expand-controls {{
+                              display: flex;
+                              gap: 8px;
+                              margin: 0 0 16px 0;
+                          }}
+                          .expand-btn {{
+                              padding: 6px 14px;
+                              border: 1px solid var(--border);
+                              border-radius: 6px;
+                              background: var(--card-bg);
+                              color: var(--text);
+                              font-size: 0.8rem;
+                              cursor: pointer;
+                              font-weight: 600;
+                          }}
+                          .expand-btn:hover {{
+                              background: #f1f5f9;
+                          }}
                       </style>
                   </head>
                   <body>
@@ -1263,12 +1309,45 @@ Resources:
                               }}
                           }});
                       </script>
+                      <script>
+                      function toggleSection(el) {{
+                          var body = el.parentElement.querySelector('.section-body');
+                          var arrow = el.querySelector('.toggle-arrow');
+                          if (body.classList.contains('collapsed')) {{
+                              body.classList.remove('collapsed');
+                              arrow.classList.remove('collapsed');
+                          }} else {{
+                              body.classList.add('collapsed');
+                              arrow.classList.add('collapsed');
+                          }}
+                      }}
+                      function expandAll() {{
+                          document.querySelectorAll('.section-body.collapsed').forEach(function(el) {{
+                              el.classList.remove('collapsed');
+                          }});
+                          document.querySelectorAll('.toggle-arrow.collapsed').forEach(function(el) {{
+                              el.classList.remove('collapsed');
+                          }});
+                      }}
+                      function collapseAll() {{
+                          document.querySelectorAll('.section-body').forEach(function(el) {{
+                              el.classList.add('collapsed');
+                          }});
+                          document.querySelectorAll('.toggle-arrow').forEach(function(el) {{
+                              el.classList.add('collapsed');
+                          }});
+                      }}
+                      </script>
                       <div class="report-header">
                           <h1>Amazon Contact Center - Operations Review</h1>
                           <div class="subtitle">Automated operational health assessment</div>
                           <div class="generated">Generated on: {escape(datetime_string)} UTC</div>
                       </div>
                       <div class="container">
+                      <div class="expand-controls">
+                          <button class="expand-btn" onclick="expandAll()">&#9660; Expand All</button>
+                          <button class="expand-btn" onclick="collapseAll()">&#9650; Collapse All</button>
+                      </div>
                       <!--SUMMARY_PLACEHOLDER-->
                       <div class="section">
                           <h2>Amazon Connect Instance Information</h2>
@@ -2870,6 +2949,112 @@ Resources:
                   logger.error(f"SEC-MCP Error: {e}")
                   return html + f"<br>Error checking MCP tool sprawl: {escape(str(e))}"
           
+
+          """AI Agent Performance Metrics (via GetMetricDataV2)"""
+          def check_ai_agent_performance_metrics(instance_id, instance_arn, days_back=7):
+              html = "<b>AI Agent Performance Metrics</b><br>"
+              logger.info(f"[AI-PERF] Starting AI Agent Performance Metrics check")
+              try:
+                  parsed = parse_connect_instance_arn(instance_arn)
+                  region = parsed['aws_region']
+                  regional_client = boto3.client('connect', region_name=region)
+
+                  end_time = datetime.now(timezone.utc)
+                  start_time = end_time - timedelta(days=days_back)
+
+                  AI_METRICS = [
+                      {'Name': 'GOAL_SUCCESS_RATE', 'label': 'Goal Success Rate', 'type': 'score', 'desc': 'Proportion of sessions where AI agent resolved the customer issue'},
+                      {'Name': 'FAITHFULNESS_SCORE', 'label': 'Faithfulness Score', 'type': 'score', 'desc': 'Responses faithful to context (1.0 = no hallucinations)'},
+                      {'Name': 'COMPLETENESS_SCORE', 'label': 'Completeness Score', 'type': 'score', 'desc': 'How complete were AI agent responses'},
+                      {'Name': 'AI_TOOL_SELECTION_ACCURACY', 'label': 'Tool Selection Accuracy', 'type': 'score', 'desc': 'Rate of correct tool selections by AI agents'},
+                      {'Name': 'AI_TOOL_PARAMETER_ACCURACY', 'label': 'Tool Parameter Accuracy', 'type': 'score', 'desc': 'Rate of correct parameters passed to tools'},
+                      {'Name': 'AI_TOOL_UTILIZATION_ACCURACY', 'label': 'Tool Utilization Accuracy', 'type': 'score', 'desc': 'Combined tool selection + parameter accuracy'},
+                      {'Name': 'KNOWLEDGE_CONTENT_REFERENCES', 'label': 'Knowledge Content References', 'type': 'count', 'desc': 'Number of KB articles referenced by AI agents'},
+                      {'Name': 'PROACTIVE_INTENTS_ANSWERED', 'label': 'Proactive Intents Answered', 'type': 'count', 'desc': 'Proactive intents successfully answered'},
+                  ]
+
+                  results = {}
+                  has_data = False
+                  for metric_def in AI_METRICS:
+                      try:
+                          resp = regional_client.get_metric_data_v2(
+                              ResourceArn=instance_arn,
+                              StartTime=start_time,
+                              EndTime=end_time,
+                              Interval={'TimeZone': 'UTC', 'IntervalPeriod': 'TOTAL'},
+                              Filters=[],
+                              Groupings=[],
+                              Metrics=[{'Name': metric_def['Name']}]
+                          )
+                          for mr in resp.get('MetricResults', []):
+                              for col in mr.get('Collections', []):
+                                  val = col.get('Value', None)
+                                  if val is not None:
+                                      results[metric_def['Name']] = val
+                                      has_data = True
+                      except Exception as metric_err:
+                          logger.debug(f"[AI-PERF] Could not fetch {metric_def['Name']}: {metric_err}")
+
+                  if not has_data:
+                      html += f"<p>No AI agent performance data available for the last {days_back} days. AI agents may not have been used, or metrics are still being computed (updated every 24 hours).</p>"
+                      return html
+
+                  html += f"<p>AI Agent performance scorecard for the last {days_back} days. Scores are 0-1 (1.0 = perfect). Updated every 24 hours.</p>"
+
+                  score_metrics = [m for m in AI_METRICS if m['type'] == 'score']
+                  html += """<table style="width: 80%"><tr><th>Metric</th><th style="text-align:center;">Score</th><th>Status</th><th>Description</th></tr>"""
+                  for m in score_metrics:
+                      val = results.get(m['Name'])
+                      if val is not None:
+                          pct = val * 100
+                          if pct >= 80:
+                              color = '#00FF00'
+                              status = 'Good'
+                          elif pct >= 60:
+                              color = '#FFA500'
+                              status = 'Needs Improvement'
+                          else:
+                              color = '#FF0000'
+                              status = 'Poor'
+                          html += f'<tr><td><strong>{escape(m["label"])}</strong></td><td style="text-align:center; font-weight:bold;">{pct:.1f}%</td><td style="background-color: {color};">{status}</td><td>{escape(m["desc"])}</td></tr>'
+                      else:
+                          html += f'<tr><td><strong>{escape(m["label"])}</strong></td><td style="text-align:center;">-</td><td>No data</td><td>{escape(m["desc"])}</td></tr>'
+                  html += "</table>"
+
+                  count_metrics = [m for m in AI_METRICS if m['type'] == 'count']
+                  if any(results.get(m['Name']) is not None for m in count_metrics):
+                      html += "<br><b>Activity Metrics</b><br>"
+                      html += """<table style="width: 60%"><tr><th>Metric</th><th style="text-align:center;">Count</th><th>Description</th></tr>"""
+                      for m in count_metrics:
+                          val = results.get(m['Name'])
+                          display = f"{int(val):,}" if val is not None else '-'
+                          html += f'<tr><td><strong>{escape(m["label"])}</strong></td><td style="text-align:center;">{display}</td><td>{escape(m["desc"])}</td></tr>'
+                      html += "</table>"
+
+                  recs = []
+                  goal_rate = results.get('GOAL_SUCCESS_RATE')
+                  faith_score = results.get('FAITHFULNESS_SCORE')
+                  tool_sel = results.get('AI_TOOL_SELECTION_ACCURACY')
+                  kb_refs = results.get('KNOWLEDGE_CONTENT_REFERENCES')
+                  if goal_rate is not None and goal_rate < 0.6:
+                      recs.append("Goal Success Rate is below 60%. Review AI agent prompts, knowledge base content, and tool configurations.")
+                  if faith_score is not None and faith_score < 0.8:
+                      recs.append("Faithfulness Score is below 80%, indicating potential hallucinations. Strengthen AI guardrails and contextual grounding.")
+                  if tool_sel is not None and tool_sel < 0.7:
+                      recs.append("Tool Selection Accuracy is below 70%. Consider reducing available tools (see MCP Tool Sprawl check) or improving tool descriptions.")
+                  if kb_refs is not None and kb_refs == 0:
+                      recs.append("No knowledge base content referenced. Verify KB association and content freshness (see KB Sync Health check).")
+                  if recs:
+                      html += "<h4>Recommendations</h4><ul>"
+                      for r in recs:
+                          html += f"<li>{r}</li>"
+                      html += "</ul>"
+
+                  return html
+              except Exception as e:
+                  logger.error(f"AI-PERF Error: {e}")
+                  return html + f"<br>Error retrieving AI agent performance metrics: {escape(str(e))}"
+
           """Main Handler"""
           # ── Recommended Alarms for Amazon Connect ──
           RECOMMENDED_CONNECT_ALARMS = [
@@ -3076,7 +3261,30 @@ Resources:
                   aws_region = str(parsed['aws_region'])
                   account_id = str(parsed['account_id'])
                   logger.info (f"Instance Details parsed from env variables: {instance_arn}, AWS Region: {aws_region}, Account ID: {account_id}")
-          
+
+                  # Early AI Agent discovery (needed before pillar sections)
+                  enable_ai_checks = os.environ.get('ENABLE_AI_CHECKS', 'true').lower() == 'true'
+                  assistant_id = os.environ.get('ASSISTANT_ID', '').strip()
+                  if enable_ai_checks:
+                      if not assistant_id:
+                          assistant_id = discover_assistant_id(instance_id)
+                      logger.info(f"[AI-CHECKS] assistant_id={'found: ' + assistant_id if assistant_id else 'not found'}")
+                  else:
+                      assistant_id = None
+                      logger.info("[AI-CHECKS] AI Agent checks disabled")
+
+                  # Helper to determine check status from HTML output
+                  def _ai_status(html_result, warn_keywords=None, fail_keywords=None):
+                      warn_keywords = warn_keywords or ['WARNING', 'color: #FFA500', 'color: red', 'CRITICAL', 'missing', 'Missing', 'No guardrail', 'No CloudWatch', 'No KMS', 'Review']
+                      fail_keywords = fail_keywords or ['CRITICAL', 'color: red']
+                      for kw in fail_keywords:
+                          if kw in html_result:
+                              return 'fail'
+                      for kw in warn_keywords:
+                          if kw in html_result:
+                              return 'warn'
+                      return 'pass'
+
                   #Describe Instance and create the intial html output
                   result = describe_connect_to_html(instance_id)
                   if isinstance(result, tuple):
@@ -3320,7 +3528,36 @@ Resources:
                           </ul>"""
                       html_output += """</div>"""
 
-          
+                  # ── AI Security Checks (S1-S4) ──
+                  if assistant_id:
+                      html_output += '<div class="section" id="ai-s1"><h3>AI Guardrails</h3>'
+                      html_output += '<p><em>Verifies AI guardrails are deployed with all critical filter types and checks which AI agents have guardrails associated.</em></p>'
+                      _s1_html = check_q_guardrails(assistant_id)
+                      html_output += _s1_html + '</div>'
+                      _s1_status = 'fail' if 'No published AI guardrails' in _s1_html or 'No guardrail' in _s1_html else _ai_status(_s1_html)
+                      checks.append({"pillar": "Security", "check": "AI Guardrails", "status": _s1_status, "detail": "Guardrail filter coverage and agent association analyzed", "anchor": "ai-s1"})
+
+                      html_output += '<div class="section" id="ai-s2"><h3>Q in Connect Domain Encryption</h3>'
+                      html_output += '<p><em>Checks whether a customer-managed KMS key is configured for the Q in Connect domain.</em></p>'
+                      _s2_html = check_q_domain_encryption(assistant_id)
+                      html_output += _s2_html + '</div>'
+                      _s2_status = 'pass' if 'Customer-managed KMS' in _s2_html else 'warn'
+                      checks.append({"pillar": "Security", "check": "Q in Connect Domain Encryption", "status": _s2_status, "detail": "CMK configured" if _s2_status == 'pass' else "Using AWS-owned key", "anchor": "ai-s2"})
+
+                      html_output += '<div class="section" id="ai-s3"><h3>Connect Storage Encryption</h3>'
+                      html_output += '<p><em>Checks KMS encryption for call recordings, chat transcripts, and other Connect storage types.</em></p>'
+                      _s3_html = check_connect_storage_encryption(instance_id)
+                      html_output += _s3_html + '</div>'
+                      checks.append({"pillar": "Security", "check": "Connect Storage Encryption", "status": _ai_status(_s3_html, warn_keywords=['No KMS', 'AWS Managed']), "detail": "Storage KMS encryption checked", "anchor": "ai-s3"})
+
+                      html_output += '<div class="section" id="ai-s4"><h3>MCP Tool Sprawl Detection</h3>'
+                      html_output += '<p><em>Detects excessive MCP tool permissions on security profiles that increase AI agent inference latency.</em></p>'
+                      _s4_html = check_mcp_tool_sprawl(instance_id)
+                      html_output += _s4_html + '</div>'
+                      _s4_status = 'fail' if 'CRITICAL' in _s4_html else _ai_status(_s4_html)
+                      checks.append({"pillar": "Security", "check": "MCP Tool Sprawl", "status": _s4_status, "detail": "Security profile MCP tool counts analyzed", "anchor": "ai-s4"})
+                      logger.info(f"AI Security checks (S1-S4) completed")
+
                   html_output += """<h2>Resilience</h2>
                       <div class="section">
                           <h3>Multi-AZ Architecture</h3>
@@ -3517,6 +3754,16 @@ Resources:
                       checks.append({"pillar": "Capacity Analysis", "check": "Amazon Connect Concurrency Limits", "status": "pass", "detail": f"{len(conc_items)} concurrency metrics within safe limits", "anchor": "cap-concurrency"})
 
                   #HTML Output - Connect Usage Vs Limits
+                  # ── AI Resilience Check (R1) ──
+                  if assistant_id:
+                      html_output += '<div class="section" id="ai-r1"><h3>Knowledge Base Sync Health</h3>'
+                      html_output += '<p><em>Checks knowledge base associations and content freshness.</em></p>'
+                      _r1_html = check_kb_sync_health(assistant_id)
+                      html_output += _r1_html + '</div>'
+                      _r1_status = 'warn' if 'Review' in _r1_html and 'to review' in _r1_html else 'pass'
+                      checks.append({"pillar": "Resilience", "check": "Knowledge Base Sync Health", "status": _r1_status, "detail": "Knowledge base freshness checked", "anchor": "ai-r1"})
+                      logger.info("AI Resilience check (R1) completed")
+
                   html_output += f"""
                       <h2>Operational Excellence</h2>"""
 
@@ -3642,6 +3889,21 @@ Resources:
                       else:
                           checks.append({"pillar": "Operational Excellence", "check": "KVS Retention Period", "status": "pass", "detail": f"All {len(kvs_all)} KVS stream(s) have retention > 0h", "anchor": "ops-kvs-retention"})
                       html_output += """</div>"""
+
+                  # ── AI Operational Excellence Checks (O1, O2) ──
+                  if assistant_id:
+                      html_output += '<div class="section" id="ai-o1"><h3>AI Agent Inventory &amp; Status</h3>'
+                      html_output += '<p><em>Lists all AI agents, their types (self-service/agent-assist), and deployment status.</em></p>'
+                      _o1_html = check_ai_agent_inventory(assistant_id, instance_id)
+                      html_output += _o1_html + '</div>'
+                      checks.append({"pillar": "Operational Excellence", "check": "AI Agent Inventory", "status": _ai_status(_o1_html, warn_keywords=['No AI agents']), "detail": "Agent inventory collected", "anchor": "ai-o1"})
+
+                      html_output += '<div class="section" id="ai-o2"><h3>AI Prompt Configuration</h3>'
+                      html_output += '<p><em>Reviews AI prompt model selection. Model choice affects response latency and quality, not cost.</em></p>'
+                      _o2_html = check_ai_prompt_configuration(assistant_id)
+                      html_output += _o2_html + '</div>'
+                      checks.append({"pillar": "Operational Excellence", "check": "AI Prompt Configuration", "status": _ai_status(_o2_html, warn_keywords=['Higher latency']), "detail": "Prompt model selection reviewed", "anchor": "ai-o2"})
+                      logger.info("AI Operational Excellence checks (O1, O2) completed")
 
                   # ── Capacity Analysis ──
                   html_output += f"""
@@ -3827,6 +4089,21 @@ Resources:
                   logger.info(f"Account Level API Limits Module execution time: {duration}")
                   lambda_exec_intermediate_time = time.time()
 
+                  # ── AI Capacity Checks (Q1, Q2) ──
+                  if assistant_id:
+                      html_output += '<div class="section" id="ai-q1"><h3>Q in Connect Service Limits</h3>'
+                      html_output += '<p><em>Checks usage against non-adjustable Q in Connect limits.</em></p>'
+                      _q1_html = check_q_hard_limits(assistant_id)
+                      html_output += _q1_html + '</div>'
+                      checks.append({"pillar": "Capacity Analysis", "check": "Q in Connect Limits", "status": _ai_status(_q1_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Service limits and article counts checked", "anchor": "ai-q1"})
+
+                      html_output += '<div class="section" id="ai-q2"><h3>Lambda Integration Limits</h3>'
+                      html_output += '<p><em>Counts Lambda functions against the 50-function limit.</em></p>'
+                      _q2_html = check_lambda_integration_limits(instance_id)
+                      html_output += _q2_html + '</div>'
+                      checks.append({"pillar": "Capacity Analysis", "check": "Lambda Integration Limits", "status": _ai_status(_q2_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Lambda function count vs 50-function limit", "anchor": "ai-q2"})
+                      logger.info("AI Capacity checks (Q1, Q2) completed")
+
                   # ── CloudWatch Alarm Validation  ──
                   html_output += f"""
                       <h2>Observability</h2>"""
@@ -4010,6 +4287,30 @@ Resources:
                   metadata = phone_type_counts.get('_metadata', {})
                   total_numbers = metadata.get('total_numbers', 0)
           
+                  # ── AI Observability Checks (P1, P2, AI-PERF) ──
+                  if assistant_id:
+                      html_output += '<div class="section" id="ai-p1"><h3>AI Agent Logging &amp; Observability</h3>'
+                      html_output += '<p><em>Checks if CloudWatch event log delivery is configured for the AI assistant.</em></p>'
+                      _p1_html = check_ai_agent_logging(assistant_id, account_id, aws_region)
+                      html_output += _p1_html + '</div>'
+                      _p1_status = 'pass' if 'log delivery configured' in _p1_html else 'warn'
+                      checks.append({"pillar": "Observability", "check": "AI Agent Logging", "status": _p1_status, "detail": "Log delivery configured" if _p1_status == 'pass' else "No Vended Logs delivery found", "anchor": "ai-p1"})
+
+                      html_output += '<div class="section" id="ai-p2"><h3>Contact Flow Errors (AI)</h3>'
+                      html_output += '<p><em>Monitors ContactFlowErrors and ContactFlowFatalErrors from CloudWatch.</em></p>'
+                      _p2_html = check_flow_errors(instance_id, days_back)
+                      html_output += _p2_html + '</div>'
+                      _p2_status = 'fail' if 'CRITICAL' in _p2_html else ('warn' if 'WARNING' in _p2_html else 'pass')
+                      checks.append({"pillar": "Observability", "check": "Contact Flow Errors (AI)", "status": _p2_status, "detail": "Flow error metrics analyzed", "anchor": "ai-p2"})
+
+                      html_output += '<div class="section" id="ai-perf"><h3>AI Agent Performance Metrics</h3>'
+                      html_output += '<p><em>Scorecard of AI agent quality metrics: goal success, faithfulness, tool accuracy.</em></p>'
+                      _perf_html = check_ai_agent_performance_metrics(instance_id, instance_arn, days_back)
+                      html_output += _perf_html + '</div>'
+                      _perf_status = 'fail' if ('Poor' in _perf_html or '#FF0000' in _perf_html) else ('warn' if ('Needs Improvement' in _perf_html or '#FFA500' in _perf_html) else ('info' if 'No AI agent performance data' in _perf_html else 'pass'))
+                      checks.append({"pillar": "Observability", "check": "AI Agent Performance Metrics", "status": _perf_status, "detail": "Goal success, faithfulness, tool accuracy scorecard", "anchor": "ai-perf"})
+                      logger.info("AI Observability checks (P1, P2, AI-PERF) completed")
+
                   html_output += f"""
                       <h2>Cost Considerations</h2>
                       <div class="section" id="cost-phone">
@@ -4115,7 +4416,24 @@ Resources:
                       </html>
                       """
 
-                  # ── Generate Executive Summary and inject at top ──
+                  # Get key metrics
+                  get_connect_metric_simple(instance_id, 'CallsPerInterval', days_back)
+                  get_connect_metric_simple(instance_id, 'ConcurrentCalls', days_back)
+                  get_connect_metric_simple(instance_id, 'MissedCalls', days_back)
+                  get_connect_metric_simple(instance_id, 'QueueSize', days_back)
+          
+          
+          
+                  # (AI checks already distributed into pillar sections above)
+                  if assistant_id:
+                      logger.info("All AI Agent checks completed (distributed across pillars)")
+                  elif enable_ai_checks:
+                      logger.info("No assistant ID found. AI checks skipped.")
+                  else:
+                      logger.info("AI Agent checks disabled")
+          
+
+                  # ── Generate Executive Summary and inject at top (after ALL checks including AI) ──
                   pass_count = sum(1 for c in checks if c["status"] == "pass")
                   fail_count = sum(1 for c in checks if c["status"] == "fail")
                   warn_count = sum(1 for c in checks if c["status"] == "warn")
@@ -4156,15 +4474,9 @@ Resources:
                       <table style="width:100%;">
                           <tr><th>Pillar</th><th>Check</th><th>Status</th><th>Detail</th></tr>"""
 
-                  # Sort checks by pillar order (matching HTML), then by status severity within each pillar
                   pillar_order = ["Security", "Resilience", "Operational Excellence", "Capacity Analysis", "Observability", "Cost"]
                   status_order = {"fail": 0, "warn": 1, "info": 2, "pass": 3}
-                  # Fixed order for Capacity Analysis checks
-                  capacity_check_order = [
-                      "Amazon Connect Instance Resource Limits",
-                      "Amazon Connect Concurrency Limits",
-                      "Amazon Connect API Limits (Account Level)",
-                  ]
+                  capacity_check_order = ["Amazon Connect Instance Resource Limits", "Amazon Connect Concurrency Limits", "Amazon Connect API Limits (Account Level)"]
                   sorted_checks = sorted(checks, key=lambda c: (
                       pillar_order.index(c["pillar"]) if c["pillar"] in pillar_order else 99,
                       capacity_check_order.index(c["check"]) if c["pillar"] == "Capacity Analysis" and c["check"] in capacity_check_order else status_order.get(c["status"], 99)
@@ -4174,11 +4486,9 @@ Resources:
                   for c in sorted_checks:
                       st = c["status"]
                       anchor = c.get("anchor", "")
-                      # Add pillar separator row when pillar changes
                       if c["pillar"] != current_pillar:
                           current_pillar = c["pillar"]
                           pillar_checks = [x for x in sorted_checks if x["pillar"] == current_pillar]
-                          pillar_pass = sum(1 for x in pillar_checks if x["status"] == "pass")
                           pillar_fail = sum(1 for x in pillar_checks if x["status"] == "fail")
                           pillar_warn = sum(1 for x in pillar_checks if x["status"] == "warn")
                           pillar_badge = ""
@@ -4186,195 +4496,27 @@ Resources:
                               pillar_badge = f'<span style="background:#ef4444; color:#fff; padding:2px 8px; border-radius:999px; font-size:0.75em; margin-left:8px;">{pillar_fail} fail</span>'
                           if pillar_warn > 0:
                               pillar_badge += f'<span style="background:#f59e0b; color:#fff; padding:2px 8px; border-radius:999px; font-size:0.75em; margin-left:4px;">{pillar_warn} warn</span>'
-                          summary_html += f"""<tr style="background-color:#f1f5f9;">
-                              <td colspan="4" style="font-weight:700; font-size:0.9rem; padding:10px 14px; color:#334155;">{escape(current_pillar)} ({len(pillar_checks)} checks) {pillar_badge}</td>
-                          </tr>"""
+                          summary_html += f"""<tr style="background-color:#f1f5f9;"><td colspan="4" style="font-weight:700; font-size:0.9rem; padding:10px 14px; color:#334155;">{escape(current_pillar)} ({len(pillar_checks)} checks) {pillar_badge}</td></tr>"""
                       check_link = f'<a href="#{anchor}" style="color:{STATUS_CONFIG[st]["color"]}; text-decoration:none; border-bottom:1px dashed {STATUS_CONFIG[st]["border"]}; font-weight:600;">{escape(c["check"])}</a>' if anchor else f'<span style="font-weight:600;">{escape(c["check"])}</span>'
-                      summary_html += f"""<tr style="background-color:{STATUS_CONFIG[st]["bg"]}; border-left:4px solid {STATUS_CONFIG[st]["border"]};">
-                          <td style="font-weight:700; font-size:0.85rem;">{escape(c["pillar"])}</td>
-                          <td style="font-size:0.85rem;">{check_link}</td>
-                          <td style="font-size:0.85rem;">{STATUS_CONFIG[st]["icon"]} <span style="color:{STATUS_CONFIG[st]["color"]}; font-weight:700;">{STATUS_CONFIG[st]["label"]}</span></td>
-                          <td style="font-size:0.85rem;">{escape(c["detail"])}</td>
-                      </tr>"""
+                      summary_html += f"""<tr style="background-color:{STATUS_CONFIG[st]["bg"]}; border-left:4px solid {STATUS_CONFIG[st]["border"]};"><td style="font-weight:700; font-size:0.85rem;">{escape(c["pillar"])}</td><td style="font-size:0.85rem;">{check_link}</td><td style="font-size:0.85rem;">{STATUS_CONFIG[st]["icon"]} <span style="color:{STATUS_CONFIG[st]["color"]}; font-weight:700;">{STATUS_CONFIG[st]["label"]}</span></td><td style="font-size:0.85rem;">{escape(c["detail"])}</td></tr>"""
 
                   summary_html += """</table></div>"""
-
-                  # Replace placeholder with actual summary
                   html_output = html_output.replace(SUMMARY_PLACEHOLDER, summary_html)
 
-                  # Get key metrics
-                  get_connect_metric_simple(instance_id, 'CallsPerInterval', days_back)
-                  get_connect_metric_simple(instance_id, 'ConcurrentCalls', days_back)
-                  get_connect_metric_simple(instance_id, 'MissedCalls', days_back)
-                  get_connect_metric_simple(instance_id, 'QueueSize', days_back)
-          
-          
-          
-                  # ============================================================================
-                  # AI AGENT CHECKS (11 Checks)
-                  # ============================================================================
-                  enable_ai_checks = os.environ.get('ENABLE_AI_CHECKS', 'true').lower() == 'true'
-                  assistant_id = os.environ.get('ASSISTANT_ID', '').strip()
-          
-                  logger.info(f"[AI-CHECKS] Config: enable_ai_checks={enable_ai_checks}, "
-                              f"ASSISTANT_ID env='{os.environ.get('ASSISTANT_ID', '<not set>')}', "
-                              f"assistant_id after strip='{assistant_id}'")
-          
-                  if enable_ai_checks:
-                      logger.info("[AI-CHECKS] AI Agent checks ENABLED. Starting...")
-                      lambda_exec_intermediate_time = time.time()
-          
-                      # Auto-discover assistant ID if not provided
-                      if not assistant_id:
-                          logger.info("[AI-CHECKS] ASSISTANT_ID not set or empty, attempting auto-discovery...")
-                          assistant_id = discover_assistant_id(instance_id)
-                      else:
-                          logger.info(f"[AI-CHECKS] Using provided ASSISTANT_ID: {assistant_id}")
-          
-                      if assistant_id:
-                          logger.info(f"[AI-CHECKS] Proceeding with assistant_id={assistant_id}")
-          
-                          # --- AI Agent Checks (integrated into existing pillars) ---
-                          html_output += """<h2>AI Agent</h2>
-                              <p>Amazon Connect AI Agents (Q in Connect) provide AI-powered self-service and agent-assist capabilities.</p>"""
+                  # Post-process: make each section collapsible
+                  import re as _re
+                  def _make_collapsible(match):
+                      attrs = match.group(1) or ''
+                      h3_content = match.group(2)
+                      rest = match.group(3)
+                      return f'<div class="section"{attrs}><div class="section-header" onclick="toggleSection(this)"><span class="toggle-arrow">&#9660;</span><h3 style="margin:0;">{h3_content}</h3></div><div class="section-body">{rest}</div></div>'
+                  html_output = _re.sub(
+                      r'<div class="section"([^>]*)>\s*<h3[^>]*>(.*?)</h3>(.*?)</div>\s*(?=<div class="section"|<h2|</div>\s*</body>|$)',
+                      _make_collapsible,
+                      html_output,
+                      flags=_re.DOTALL
+                  )
 
-                          # Helper to determine check status from HTML output
-                          def _ai_status(html_result, warn_keywords=None, fail_keywords=None):
-                              warn_keywords = warn_keywords or ['WARNING', 'color: #FFA500', 'color: red', 'CRITICAL', 'missing', 'Missing', 'No guardrail', 'No CloudWatch', 'No KMS', 'Review']
-                              fail_keywords = fail_keywords or ['CRITICAL', 'color: red']
-                              for kw in fail_keywords:
-                                  if kw in html_result:
-                                      return 'fail'
-                              for kw in warn_keywords:
-                                  if kw in html_result:
-                                      return 'warn'
-                              return 'pass'
-
-                          # --- O1: AI Agent Inventory ---
-                          html_output += '<div class="section" id="ai-o1"><h3>AI Agent Inventory &amp; Status</h3>'
-                          html_output += '<p><em>Lists all AI agents configured for this assistant, their types (self-service/agent-assist), and deployment status.</em></p>'
-                          _o1_html = check_ai_agent_inventory(assistant_id, instance_id)
-                          html_output += _o1_html
-                          html_output += '</div>'
-                          checks.append({"pillar": "Operational Excellence", "check": "AI Agent Inventory", "status": _ai_status(_o1_html, warn_keywords=['No AI agents']), "detail": "Agent inventory collected", "anchor": "ai-o1"})
-                          logger.info(f"O1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- O2: AI Prompt Configuration ---
-                          html_output += '<div class="section" id="ai-o2"><h3>AI Prompt Configuration</h3>'
-                          html_output += '<p><em>Reviews AI prompt model selection. Model choice affects response latency and quality, not cost (Connect bills flat rate per message).</em></p>'
-                          _o2_html = check_ai_prompt_configuration(assistant_id)
-                          html_output += _o2_html
-                          html_output += '</div>'
-                          checks.append({"pillar": "Operational Excellence", "check": "AI Prompt Configuration", "status": _ai_status(_o2_html, warn_keywords=['Higher latency']), "detail": "Prompt model selection reviewed", "anchor": "ai-o2"})
-                          logger.info(f"O2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- S1: Q Guardrails ---
-                          html_output += '<div class="section" id="ai-s1"><h3>AI Guardrails</h3>'
-                          html_output += '<p><em>Verifies AI guardrails are deployed with all critical filter types and checks which AI agents have guardrails associated.</em></p>'
-                          _s1_html = check_q_guardrails(assistant_id)
-                          html_output += _s1_html
-                          html_output += '</div>'
-                          _s1_status = 'fail' if 'No published AI guardrails' in _s1_html or 'No guardrail' in _s1_html else _ai_status(_s1_html)
-                          checks.append({"pillar": "Security", "check": "AI Guardrails", "status": _s1_status, "detail": "Guardrail filter coverage and agent association analyzed", "anchor": "ai-s1"})
-                          logger.info(f"S1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- S2: Domain Encryption ---
-                          html_output += '<div class="section" id="ai-s2"><h3>Q in Connect Domain Encryption</h3>'
-                          html_output += '<p><em>Checks whether a customer-managed KMS key is configured for the Q in Connect domain.</em></p>'
-                          _s2_html = check_q_domain_encryption(assistant_id)
-                          html_output += _s2_html
-                          html_output += '</div>'
-                          _s2_status = 'pass' if 'Customer-managed KMS' in _s2_html else 'warn'
-                          checks.append({"pillar": "Security", "check": "Q in Connect Domain Encryption", "status": _s2_status, "detail": "CMK configured" if _s2_status == 'pass' else "Using AWS-owned key", "anchor": "ai-s2"})
-                          logger.info(f"S2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- S3: Connect Storage Encryption ---
-                          html_output += '<div class="section" id="ai-s3"><h3>Connect Storage Encryption</h3>'
-                          html_output += '<p><em>Checks KMS encryption for call recordings, chat transcripts, and other Connect storage types.</em></p>'
-                          _s3_html = check_connect_storage_encryption(instance_id)
-                          html_output += _s3_html
-                          html_output += '</div>'
-                          checks.append({"pillar": "Security", "check": "Connect Storage Encryption", "status": _ai_status(_s3_html, warn_keywords=['No KMS', 'AWS Managed']), "detail": "Storage KMS encryption checked", "anchor": "ai-s3"})
-                          logger.info(f"S3 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- S4: MCP Tool Sprawl ---
-                          html_output += '<div class="section" id="ai-s4"><h3>MCP Tool Sprawl Detection</h3>'
-                          html_output += '<p><em>Detects excessive MCP tool permissions on security profiles that increase AI agent inference latency.</em></p>'
-                          _s4_html = check_mcp_tool_sprawl(instance_id)
-                          html_output += _s4_html
-                          html_output += '</div>'
-                          _s4_status = 'fail' if 'CRITICAL' in _s4_html else _ai_status(_s4_html)
-                          checks.append({"pillar": "Security", "check": "MCP Tool Sprawl", "status": _s4_status, "detail": "Security profile MCP tool counts analyzed", "anchor": "ai-s4"})
-                          logger.info(f"S4 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- P1: AI Agent Logging ---
-                          html_output += '<div class="section" id="ai-p1"><h3>AI Agent Logging &amp; Observability</h3>'
-                          html_output += '<p><em>Checks if CloudWatch event log delivery is configured for the AI assistant.</em></p>'
-                          _p1_html = check_ai_agent_logging(assistant_id, account_id, aws_region)
-                          html_output += _p1_html
-                          html_output += '</div>'
-                          _p1_status = 'pass' if 'log delivery configured' in _p1_html else 'warn'
-                          checks.append({"pillar": "Observability", "check": "AI Agent Logging", "status": _p1_status, "detail": "Log delivery configured" if _p1_status == 'pass' else "No Vended Logs delivery found", "anchor": "ai-p1"})
-                          logger.info(f"P1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- P2: Flow Errors ---
-                          html_output += '<div class="section" id="ai-p2"><h3>Contact Flow Errors (AI)</h3>'
-                          html_output += '<p><em>Monitors ContactFlowErrors and ContactFlowFatalErrors from CloudWatch.</em></p>'
-                          _p2_html = check_flow_errors(instance_id, days_back)
-                          html_output += _p2_html
-                          html_output += '</div>'
-                          _p2_status = 'fail' if 'CRITICAL' in _p2_html else ('warn' if 'WARNING' in _p2_html else 'pass')
-                          checks.append({"pillar": "Observability", "check": "Contact Flow Errors (AI)", "status": _p2_status, "detail": "Flow error metrics analyzed", "anchor": "ai-p2"})
-                          logger.info(f"P2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- R1: KB Sync Health ---
-                          html_output += '<div class="section" id="ai-r1"><h3>Knowledge Base Sync Health</h3>'
-                          html_output += '<p><em>Checks knowledge base associations and content freshness.</em></p>'
-                          _r1_html = check_kb_sync_health(assistant_id)
-                          html_output += _r1_html
-                          html_output += '</div>'
-                          _r1_status = 'warn' if 'Review' in _r1_html and 'to review' in _r1_html else 'pass'
-                          checks.append({"pillar": "Resilience", "check": "Knowledge Base Sync Health", "status": _r1_status, "detail": "Knowledge base freshness checked", "anchor": "ai-r1"})
-                          logger.info(f"R1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- Q1: Q Hard Limits ---
-                          html_output += '<div class="section" id="ai-q1"><h3>Q in Connect Service Limits</h3>'
-                          html_output += '<p><em>Checks usage against non-adjustable Q in Connect limits.</em></p>'
-                          _q1_html = check_q_hard_limits(assistant_id)
-                          html_output += _q1_html
-                          html_output += '</div>'
-                          checks.append({"pillar": "Capacity Analysis", "check": "Q in Connect Limits", "status": _ai_status(_q1_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Service limits and article counts checked", "anchor": "ai-q1"})
-                          logger.info(f"Q1 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-
-                          # --- Q2: Lambda Integration Limits ---
-                          html_output += '<div class="section" id="ai-q2"><h3>Lambda Integration Limits</h3>'
-                          html_output += '<p><em>Counts Lambda functions associated with the Connect instance against the 50-function limit.</em></p>'
-                          _q2_html = check_lambda_integration_limits(instance_id)
-                          html_output += _q2_html
-                          html_output += '</div>'
-                          checks.append({"pillar": "Capacity Analysis", "check": "Lambda Integration Limits", "status": _ai_status(_q2_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Lambda function count vs 50-function limit", "anchor": "ai-q2"})
-                          logger.info(f"Q2 completed in {time.time() - lambda_exec_intermediate_time:.1f}s")
-                          lambda_exec_intermediate_time = time.time()
-          
-                          logger.info("AI Agent checks completed.")
-                      else:
-                          html_output += """<h2>AI Agent Checks</h2>
-                              <p>No Q in Connect assistant found. AI Agent checks skipped.
-                              Associate a Q in Connect assistant or set <code>ASSISTANT_ID</code> env var.</p>"""
-                          logger.info("No assistant ID. AI checks skipped.")
-                  else:
-                      logger.info("AI Agent checks disabled (ENABLE_AI_CHECKS=false)")
-          
                   # Get Date timestamp
                   now_utc = datetime.now(timezone.utc)
                   date_time = now_utc.strftime("%m%d%Y_%H%M%S")
