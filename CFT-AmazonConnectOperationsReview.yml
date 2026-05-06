@@ -1337,6 +1337,19 @@ Resources:
                               el.classList.add('collapsed');
                           }});
                       }}
+                      var _allExpanded = true;
+                      function toggleAll() {{
+                          var btn = document.getElementById('toggleAllBtn');
+                          if (_allExpanded) {{
+                              collapseAll();
+                              btn.innerHTML = '&#9660; Expand All';
+                              _allExpanded = false;
+                          }} else {{
+                              expandAll();
+                              btn.innerHTML = '&#9650; Collapse All';
+                              _allExpanded = true;
+                          }}
+                      }}
                       </script>
                       <div class="report-header">
                           <h1>Amazon Contact Center - Operations Review</h1>
@@ -1345,8 +1358,7 @@ Resources:
                       </div>
                       <div class="container">
                       <div class="expand-controls">
-                          <button class="expand-btn" onclick="expandAll()">&#9660; Expand All</button>
-                          <button class="expand-btn" onclick="collapseAll()">&#9650; Collapse All</button>
+                          <button class="expand-btn" id="toggleAllBtn" onclick="toggleAll()">&#9650; Collapse All</button>
                       </div>
                       <!--SUMMARY_PLACEHOLDER-->
                       <div class="section">
@@ -1375,9 +1387,9 @@ Resources:
                           html_content += f"<tr><th>Inbound Calls Enabled</th><td>{escape(str(instance['InboundCallsEnabled']))}</td></tr>"
                       if 'OutboundCallsEnabled' in instance:
                           html_content += f"<tr><th>Outbound Calls Enabled</th><td>{escape(str(instance['OutboundCallsEnabled']))}</td></tr>"
-                      html_content += "</table></div></body></html>"
+                      html_content += "</table></div>"
           
-                      logger.debug(f"\n🔄 REPLICATION CONFIGURATION:")
+                      logger.debug(f"\n REPLICATION CONFIGURATION:")
                       html_content += """<div class="section">
                           <h3>Replication Configuration</h3>"""
           
@@ -3530,27 +3542,27 @@ Resources:
 
                   # ── AI Security Checks (S1-S4) ──
                   if assistant_id:
-                      html_output += '<div class="section" id="ai-s1"><h3>AI Guardrails</h3>'
+                      html_output += '<div class="section" id="ai-s1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Guardrails</h3>'
                       html_output += '<p><em>Verifies AI guardrails are deployed with all critical filter types and checks which AI agents have guardrails associated.</em></p>'
                       _s1_html = check_q_guardrails(assistant_id)
                       html_output += _s1_html + '</div>'
                       _s1_status = 'fail' if 'No published AI guardrails' in _s1_html or 'No guardrail' in _s1_html else _ai_status(_s1_html)
                       checks.append({"pillar": "Security", "check": "AI Guardrails", "status": _s1_status, "detail": "Guardrail filter coverage and agent association analyzed", "anchor": "ai-s1"})
 
-                      html_output += '<div class="section" id="ai-s2"><h3>Q in Connect Domain Encryption</h3>'
+                      html_output += '<div class="section" id="ai-s2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Q in Connect Domain Encryption</h3>'
                       html_output += '<p><em>Checks whether a customer-managed KMS key is configured for the Q in Connect domain.</em></p>'
                       _s2_html = check_q_domain_encryption(assistant_id)
                       html_output += _s2_html + '</div>'
                       _s2_status = 'pass' if 'Customer-managed KMS' in _s2_html else 'warn'
                       checks.append({"pillar": "Security", "check": "Q in Connect Domain Encryption", "status": _s2_status, "detail": "CMK configured" if _s2_status == 'pass' else "Using AWS-owned key", "anchor": "ai-s2"})
 
-                      html_output += '<div class="section" id="ai-s3"><h3>Connect Storage Encryption</h3>'
+                      html_output += '<div class="section" id="ai-s3"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Connect Storage Encryption</h3>'
                       html_output += '<p><em>Checks KMS encryption for call recordings, chat transcripts, and other Connect storage types.</em></p>'
                       _s3_html = check_connect_storage_encryption(instance_id)
                       html_output += _s3_html + '</div>'
                       checks.append({"pillar": "Security", "check": "Connect Storage Encryption", "status": _ai_status(_s3_html, warn_keywords=['No KMS', 'AWS Managed']), "detail": "Storage KMS encryption checked", "anchor": "ai-s3"})
 
-                      html_output += '<div class="section" id="ai-s4"><h3>MCP Tool Sprawl Detection</h3>'
+                      html_output += '<div class="section" id="ai-s4"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>MCP Tool Sprawl Detection</h3>'
                       html_output += '<p><em>Detects excessive MCP tool permissions on security profiles that increase AI agent inference latency.</em></p>'
                       _s4_html = check_mcp_tool_sprawl(instance_id)
                       html_output += _s4_html + '</div>'
@@ -3756,7 +3768,7 @@ Resources:
                   #HTML Output - Connect Usage Vs Limits
                   # ── AI Resilience Check (R1) ──
                   if assistant_id:
-                      html_output += '<div class="section" id="ai-r1"><h3>Knowledge Base Sync Health</h3>'
+                      html_output += '<div class="section" id="ai-r1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Knowledge Base Sync Health</h3>'
                       html_output += '<p><em>Checks knowledge base associations and content freshness.</em></p>'
                       _r1_html = check_kb_sync_health(assistant_id)
                       html_output += _r1_html + '</div>'
@@ -3892,13 +3904,13 @@ Resources:
 
                   # ── AI Operational Excellence Checks (O1, O2) ──
                   if assistant_id:
-                      html_output += '<div class="section" id="ai-o1"><h3>AI Agent Inventory &amp; Status</h3>'
+                      html_output += '<div class="section" id="ai-o1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Agent Inventory &amp; Status</h3>'
                       html_output += '<p><em>Lists all AI agents, their types (self-service/agent-assist), and deployment status.</em></p>'
                       _o1_html = check_ai_agent_inventory(assistant_id, instance_id)
                       html_output += _o1_html + '</div>'
                       checks.append({"pillar": "Operational Excellence", "check": "AI Agent Inventory", "status": _ai_status(_o1_html, warn_keywords=['No AI agents']), "detail": "Agent inventory collected", "anchor": "ai-o1"})
 
-                      html_output += '<div class="section" id="ai-o2"><h3>AI Prompt Configuration</h3>'
+                      html_output += '<div class="section" id="ai-o2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Prompt Configuration</h3>'
                       html_output += '<p><em>Reviews AI prompt model selection. Model choice affects response latency and quality, not cost.</em></p>'
                       _o2_html = check_ai_prompt_configuration(assistant_id)
                       html_output += _o2_html + '</div>'
@@ -4091,13 +4103,13 @@ Resources:
 
                   # ── AI Capacity Checks (Q1, Q2) ──
                   if assistant_id:
-                      html_output += '<div class="section" id="ai-q1"><h3>Q in Connect Service Limits</h3>'
+                      html_output += '<div class="section" id="ai-q1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Q in Connect Service Limits</h3>'
                       html_output += '<p><em>Checks usage against non-adjustable Q in Connect limits.</em></p>'
                       _q1_html = check_q_hard_limits(assistant_id)
                       html_output += _q1_html + '</div>'
                       checks.append({"pillar": "Capacity Analysis", "check": "Q in Connect Limits", "status": _ai_status(_q1_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Service limits and article counts checked", "anchor": "ai-q1"})
 
-                      html_output += '<div class="section" id="ai-q2"><h3>Lambda Integration Limits</h3>'
+                      html_output += '<div class="section" id="ai-q2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Lambda Integration Limits</h3>'
                       html_output += '<p><em>Counts Lambda functions against the 50-function limit.</em></p>'
                       _q2_html = check_lambda_integration_limits(instance_id)
                       html_output += _q2_html + '</div>'
@@ -4289,21 +4301,21 @@ Resources:
           
                   # ── AI Observability Checks (P1, P2, AI-PERF) ──
                   if assistant_id:
-                      html_output += '<div class="section" id="ai-p1"><h3>AI Agent Logging &amp; Observability</h3>'
+                      html_output += '<div class="section" id="ai-p1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Agent Logging &amp; Observability</h3>'
                       html_output += '<p><em>Checks if CloudWatch event log delivery is configured for the AI assistant.</em></p>'
                       _p1_html = check_ai_agent_logging(assistant_id, account_id, aws_region)
                       html_output += _p1_html + '</div>'
                       _p1_status = 'pass' if 'log delivery configured' in _p1_html else 'warn'
                       checks.append({"pillar": "Observability", "check": "AI Agent Logging", "status": _p1_status, "detail": "Log delivery configured" if _p1_status == 'pass' else "No Vended Logs delivery found", "anchor": "ai-p1"})
 
-                      html_output += '<div class="section" id="ai-p2"><h3>Contact Flow Errors (AI)</h3>'
+                      html_output += '<div class="section" id="ai-p2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Contact Flow Errors (AI)</h3>'
                       html_output += '<p><em>Monitors ContactFlowErrors and ContactFlowFatalErrors from CloudWatch.</em></p>'
                       _p2_html = check_flow_errors(instance_id, days_back)
                       html_output += _p2_html + '</div>'
                       _p2_status = 'fail' if 'CRITICAL' in _p2_html else ('warn' if 'WARNING' in _p2_html else 'pass')
                       checks.append({"pillar": "Observability", "check": "Contact Flow Errors (AI)", "status": _p2_status, "detail": "Flow error metrics analyzed", "anchor": "ai-p2"})
 
-                      html_output += '<div class="section" id="ai-perf"><h3>AI Agent Performance Metrics</h3>'
+                      html_output += '<div class="section" id="ai-perf"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Agent Performance Metrics</h3>'
                       html_output += '<p><em>Scorecard of AI agent quality metrics: goal success, faithfulness, tool accuracy.</em></p>'
                       _perf_html = check_ai_agent_performance_metrics(instance_id, instance_arn, days_back)
                       html_output += _perf_html + '</div>'
@@ -4497,7 +4509,8 @@ Resources:
                           if pillar_warn > 0:
                               pillar_badge += f'<span style="background:#f59e0b; color:#fff; padding:2px 8px; border-radius:999px; font-size:0.75em; margin-left:4px;">{pillar_warn} warn</span>'
                           summary_html += f"""<tr style="background-color:#f1f5f9;"><td colspan="4" style="font-weight:700; font-size:0.9rem; padding:10px 14px; color:#334155;">{escape(current_pillar)} ({len(pillar_checks)} checks) {pillar_badge}</td></tr>"""
-                      check_link = f'<a href="#{anchor}" style="color:{STATUS_CONFIG[st]["color"]}; text-decoration:none; border-bottom:1px dashed {STATUS_CONFIG[st]["border"]}; font-weight:600;">{escape(c["check"])}</a>' if anchor else f'<span style="font-weight:600;">{escape(c["check"])}</span>'
+                      ai_badge = '<span style="background:#232F3E; color:#FF9900; padding:1px 6px; border-radius:3px; font-size:0.65rem; font-weight:700; margin-right:6px; vertical-align:middle;">AI</span>' if anchor.startswith('ai-') else ''
+                      check_link = f'<a href="#{anchor}" style="color:{STATUS_CONFIG[st]["color"]}; text-decoration:none; border-bottom:1px dashed {STATUS_CONFIG[st]["border"]}; font-weight:600;">{ai_badge}{escape(c["check"])}</a>' if anchor else f'<span style="font-weight:600;">{escape(c["check"])}</span>'
                       summary_html += f"""<tr style="background-color:{STATUS_CONFIG[st]["bg"]}; border-left:4px solid {STATUS_CONFIG[st]["border"]};"><td style="font-weight:700; font-size:0.85rem;">{escape(c["pillar"])}</td><td style="font-size:0.85rem;">{check_link}</td><td style="font-size:0.85rem;">{STATUS_CONFIG[st]["icon"]} <span style="color:{STATUS_CONFIG[st]["color"]}; font-weight:700;">{STATUS_CONFIG[st]["label"]}</span></td><td style="font-size:0.85rem;">{escape(c["detail"])}</td></tr>"""
 
                   summary_html += """</table></div>"""
