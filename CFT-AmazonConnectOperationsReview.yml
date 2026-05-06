@@ -39,7 +39,7 @@ Parameters:
     ConstraintDescription: 'Must be a valid S3 bucket name'
 
 Resources:
-  # Boto3 Lambda Layer — auto-created to provide updated boto3 for Q in Connect AI Agent APIs
+  # Boto3 Lambda Layer - auto-created to provide updated boto3 for Q in Connect AI Agent APIs
   # The default Lambda runtime boto3 (1.40.x) does not support orchestrationAIAgentConfiguration
   Boto3LayerBuilder:
     Type: AWS::Lambda::Function
@@ -2202,9 +2202,9 @@ Resources:
                           else:
                               tool_cell = '<span style="color:#999;">None</span>'
           
-                          # Find security profile — match by checking which profile has MCP apps
+                          # Find security profile - match by checking which profile has MCP apps
                           # whose namespace matches tools in this agent
-                          sp_cell = '<span style="color:#999;">—</span>'
+                          sp_cell = '<span style="color:#999;">-</span>'
                           agent_tool_ids = set()
                           for t in tools:
                               tid = t.get('toolId', '')
@@ -2458,7 +2458,7 @@ Resources:
                           html += f'<tr><td>{escape(a["name"])}</td><td>{escape(a["guardrail_id"])}</td><td style="background-color: #FFA500;">DRAFT ONLY (not live)</td></tr>'
                       html += "</table>"
                   if draft_only > 0:
-                      html += f'<br><span style="color: #FFA500; font-weight: bold;">{draft_only} agent(s) have guardrails in draft/SAVED state only — publish the agent to activate guardrail protection.</span><br>'
+                      html += f'<br><span style="color: #FFA500; font-weight: bold;">{draft_only} agent(s) have guardrails in draft/SAVED state only - publish the agent to activate guardrail protection.</span><br>'
                   if agents_without_guardrail:
                       html += '<br><span style="color: #FFA500;">AI agents without any guardrail:</span><ul>'
                       for a_name in agents_without_guardrail:
@@ -2475,9 +2475,9 @@ Resources:
                       if missing_checks:
                           html += "<li>Add missing filter types to existing guardrails (see table above).</li>"
                       if agents_with_guardrail_draft_only:
-                          html += f"<li>{draft_only} AI agent(s) have guardrails in draft/SAVED state only — publish the agent version to activate protection.</li>"
+                          html += f"<li>{draft_only} AI agent(s) have guardrails in draft/SAVED state only - publish the agent version to activate protection.</li>"
                       if agents_without_guardrail:
-                          html += f"<li>{unprotected} AI agent(s) have no guardrail at all — configure guardrails in the AI agent's orchestration settings.</li>"
+                          html += f"<li>{unprotected} AI agent(s) have no guardrail at all - configure guardrails in the AI agent's orchestration settings.</li>"
                       html += """<li>Recommended filter coverage: Content Filter + PII Filter + Denied Topics + Word Filter + Contextual Grounding.</li>
                           <li>Maximum 3 custom guardrails per assistant.</li>
                           <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-guardrails.html" target="_blank">documentation</a>.</li></ul>"""
@@ -2941,7 +2941,7 @@ Resources:
           
                       # Show API target breakdown for critical profiles
                       for p in critical_profiles:
-                          html += f"<br><strong>Profile: {escape(p['name'])} — {p['tool_count']} tools across {p['target_count']} API targets:</strong><br>"
+                          html += f"<br><strong>Profile: {escape(p['name'])} - {p['tool_count']} tools across {p['target_count']} API targets:</strong><br>"
                           html += """<table style="width: 60%"><tr><th>API Target</th><th>Operations</th></tr>"""
                           for target, ops in p['api_targets'].items():
                               html += f"<tr><td>{escape(target)}</td><td>{len(ops)} ({', '.join(escape(o) for o in ops[:5])}{'...' if len(ops) > 5 else ''})</td></tr>"
@@ -3489,7 +3489,7 @@ Resources:
                       kvs_streams = [s for s in streaming_encryption_info if s['stream_type'] == 'Kinesis Video Stream']
                       kvs_encrypted = sum(1 for s in kvs_streams if s['encrypted'] is True)
                       kvs_unencrypted = sum(1 for s in kvs_streams if s['encrypted'] is False)
-                      # KDS/Firehose: encryption is at stream level, not in Connect config — unknown from here
+                      # KDS/Firehose: encryption is at stream level, not in Connect config - unknown from here
                       kds_streams = [s for s in streaming_encryption_info if s['stream_type'] == 'Kinesis Data Stream']
                       firehose_streams = [s for s in streaming_encryption_info if s['stream_type'] == 'Kinesis Firehose']
 
@@ -3693,7 +3693,7 @@ Resources:
                   # Cache cfs_current for reuse in logging section
                   cfs_current = next((cur for lbl, cur, _, _ in instance_resource_data if lbl == "Contact Flows per instance"), 0)
 
-                  # Concurrency limits — data-driven
+                  # Concurrency limits - data-driven
                   CONCURRENCY_QUOTAS = [
                       ("Concurrent active calls per instance",   'L-12AB7C57', 'ConcurrentCalls',          'ConcurrentCallsPercentage',          'VoiceCalls', True),
                       ("Concurrent active chats per instance",   'L-D4BA6F6E', 'ConcurrentActiveChats',    'ConcurrentActiveChatsPercentage',    'Chats',      False),
@@ -4016,7 +4016,7 @@ Resources:
                           api_rate_count += 1
 
                           if applied and current_val != default_val:
-                              # Modified quota — fetch utilization
+                              # Modified quota - fetch utilization
                               util_display = "-"
                               usage_metric = applied.get('UsageMetric')
                               if usage_metric:
@@ -4043,7 +4043,7 @@ Resources:
                               </tr>""")
                               modified_count += 1
                           else:
-                              # Default quota — no utilization lookup
+                              # Default quota - no utilization lookup
                               default_row_parts.append(f"""<tr>
                                   <th>{escape(str(qname))}</th>
                                   <td style="text-align:center;">{default_val}</td>
@@ -4109,12 +4109,7 @@ Resources:
                       html_output += _q1_html + '</div>'
                       checks.append({"pillar": "Capacity Analysis", "check": "Q in Connect Limits", "status": _ai_status(_q1_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Service limits and article counts checked", "anchor": "ai-q1"})
 
-                      html_output += '<div class="section" id="ai-q2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Lambda Integration Limits</h3>'
-                      html_output += '<p><em>Counts Lambda functions against the 50-function limit.</em></p>'
-                      _q2_html = check_lambda_integration_limits(instance_id)
-                      html_output += _q2_html + '</div>'
-                      checks.append({"pillar": "Capacity Analysis", "check": "Lambda Integration Limits", "status": _ai_status(_q2_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Lambda function count vs 50-function limit", "anchor": "ai-q2"})
-                      logger.info("AI Capacity checks (Q1, Q2) completed")
+                      logger.info("AI Capacity checks (Q1) completed")
 
                   # ── CloudWatch Alarm Validation  ──
                   html_output += f"""
@@ -4308,20 +4303,7 @@ Resources:
                       _p1_status = 'pass' if 'log delivery configured' in _p1_html else 'warn'
                       checks.append({"pillar": "Observability", "check": "AI Agent Logging", "status": _p1_status, "detail": "Log delivery configured" if _p1_status == 'pass' else "No Vended Logs delivery found", "anchor": "ai-p1"})
 
-                      html_output += '<div class="section" id="ai-p2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Contact Flow Errors (AI)</h3>'
-                      html_output += '<p><em>Monitors ContactFlowErrors and ContactFlowFatalErrors from CloudWatch.</em></p>'
-                      _p2_html = check_flow_errors(instance_id, days_back)
-                      html_output += _p2_html + '</div>'
-                      _p2_status = 'fail' if 'CRITICAL' in _p2_html else ('warn' if 'WARNING' in _p2_html else 'pass')
-                      checks.append({"pillar": "Observability", "check": "Contact Flow Errors (AI)", "status": _p2_status, "detail": "Flow error metrics analyzed", "anchor": "ai-p2"})
-
-                      html_output += '<div class="section" id="ai-perf"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Agent Performance Metrics</h3>'
-                      html_output += '<p><em>Scorecard of AI agent quality metrics: goal success, faithfulness, tool accuracy.</em></p>'
-                      _perf_html = check_ai_agent_performance_metrics(instance_id, instance_arn, days_back)
-                      html_output += _perf_html + '</div>'
-                      _perf_status = 'fail' if ('Poor' in _perf_html or '#FF0000' in _perf_html) else ('warn' if ('Needs Improvement' in _perf_html or '#FFA500' in _perf_html) else ('info' if 'No AI agent performance data' in _perf_html else 'pass'))
-                      checks.append({"pillar": "Observability", "check": "AI Agent Performance Metrics", "status": _perf_status, "detail": "Goal success, faithfulness, tool accuracy scorecard", "anchor": "ai-perf"})
-                      logger.info("AI Observability checks (P1, P2, AI-PERF) completed")
+                      logger.info("AI Observability checks (P1) completed")
 
                   html_output += f"""
                       <h2>Cost Considerations</h2>
