@@ -1,6 +1,3 @@
-# Copyright Amazon.com, Inc. or its affiliates. This material is AWS Content under the AWS Enterprise Agreement
-# or AWS Customer Agreement (as applicable) and is provided under the AWS Intellectual Property License.
-
 # CloudFormation template for Amazon Connect Operational Review
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'CloudFormation template for Amazon Connect Operational Review with embedded Lambda code. Please use us-east-1 to import this template file.'
@@ -39,59 +36,129 @@ Parameters:
     ConstraintDescription: 'Must be a valid S3 bucket name'
 
 Resources:
-  # Boto3 Lambda Layer - auto-created to provide updated boto3 for Q in Connect AI Agent APIs
-  # The default Lambda runtime boto3 (1.40.x) does not support orchestrationAIAgentConfiguration
+  # Boto3 Layer Builder - creates a Lambda Layer with latest boto3 for full qconnect API support
+  # The runtime boto3 doesn't fully support newer orchestrationAIAgentConfiguration fields
+  Boto3LayerBuilderRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Resource: "*"
+            Action:
+              - "lambda:PublishLayerVersion"
+              - "lambda:GetLayerVersion"
+            Effect: "Allow"
+        PolicyName: "LambdaLayerPublish"
+
   Boto3LayerBuilder:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub '${AWS::StackName}-boto3-layer-builder'
-      Description: 'Builds a boto3 Lambda Layer for Q in Connect API support'
+      Description: 'Builds a boto3 Lambda Layer with latest SDK for qconnect API support'
       Runtime: python3.13
       Handler: index.handler
-      Role: !GetAtt AmazonConnectOperationalReviewLambdaExecutionRole.Arn
+      Role: !GetAtt Boto3LayerBuilderRole.Arn
       Timeout: 300
       MemorySize: 512
       Code:
         ZipFile: |
-          import subprocess, zipfile, os, json, urllib.request, shutil
+          import boto3
+          import json
+          import logging
+          import os
+          import subprocess
+          import tempfile
+          import zipfile
+          import urllib.request
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
           def handler(event, context):
-              if event.get('RequestType') == 'Delete':
-                  send_response(event, context, 'SUCCESS', {})
-                  return
+              """Build and publish a boto3 Lambda Layer, respond to CloudFormation."""
+              response_url = event.get('ResponseURL', '')
+              request_type = event.get('RequestType', 'Create')
+              physical_id = event.get('PhysicalResourceId', 'boto3-layer')
+
               try:
-                  target = '/tmp/python'
-                  if os.path.exists(target):
-                      shutil.rmtree(target)
-                  subprocess.check_call(['pip', 'install', 'boto3>=1.42.0', '-t', target, '--quiet', '--no-cache-dir'])
+                  if request_type == 'Delete':
+                      send_response(response_url, event, 'SUCCESS', physical_id, {})
+                      return
+
+                  # Build layer in /tmp
+                  build_dir = tempfile.mkdtemp()
+                  python_dir = os.path.join(build_dir, 'python')
+                  os.makedirs(python_dir)
+
+                  logger.info("Installing boto3 into layer...")
+                  subprocess.check_call([
+                      'pip', 'install', 'boto3', '-t', python_dir,
+                      '--no-cache-dir', '--quiet'
+                  ])
+
+                  # Create zip
                   zip_path = '/tmp/boto3-layer.zip'
                   with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                      for root, dirs, files in os.walk(target):
+                      for root, dirs, files in os.walk(build_dir):
                           for f in files:
-                              full = os.path.join(root, f)
-                              arc = os.path.join('python', os.path.relpath(full, target))
-                              zf.write(full, arc)
-                  import boto3
-                  client = boto3.client('lambda')
-                  with open(zip_path, 'rb') as f:
-                      resp = client.publish_layer_version(
-                          LayerName=f"{os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'boto3')}-layer",
-                          Description='boto3 latest for Q Connect AI Agent API support',
-                          Content={'ZipFile': f.read()},
-                          CompatibleRuntimes=['python3.13', 'python3.12', 'python3.11'])
+                              full_path = os.path.join(root, f)
+                              arc_name = os.path.relpath(full_path, build_dir)
+                              zf.write(full_path, arc_name)
+
+                  # Publish layer
+                  lambda_client = boto3.client('lambda')
+                  with open(zip_path, 'rb') as zf:
+                      layer_content = zf.read()
+
+                  logger.info(f"Publishing layer ({len(layer_content)} bytes)...")
+                  resp = lambda_client.publish_layer_version(
+                      LayerName=f"{os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'boto3')}-layer",
+                      Description='boto3 latest for qconnect API support',
+                      Content={'ZipFile': layer_content},
+                      CompatibleRuntimes=['python3.13', 'python3.12'],
+                  )
+
                   layer_arn = resp['LayerVersionArn']
-                  send_response(event, context, 'SUCCESS', {'LayerVersionArn': layer_arn})
+                  logger.info(f"Layer published: {layer_arn}")
+
+                  send_response(response_url, event, 'SUCCESS', layer_arn, {
+                      'LayerVersionArn': layer_arn
+                  })
+
               except Exception as e:
-                  print(f"Error: {e}")
-                  send_response(event, context, 'FAILED', {'Error': str(e)})
-          def send_response(event, context, status, data):
-              body = json.dumps({'Status': status, 'Reason': f'See CW Log: {context.log_stream_name}',
-                  'PhysicalResourceId': context.log_stream_name, 'StackId': event['StackId'],
-                  'RequestId': event['RequestId'], 'LogicalResourceId': event['LogicalResourceId'], 'Data': data})
-              urllib.request.urlopen(urllib.request.Request(event['ResponseURL'], data=body.encode(), method='PUT',
-                  headers={'Content-Type': 'application/json'}))
+                  logger.error(f"Error: {e}")
+                  send_response(response_url, event, 'FAILED', physical_id, {}, str(e))
+
+          def send_response(url, event, status, physical_id, data, reason=''):
+              """Send response to CloudFormation."""
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or 'See CloudWatch Logs',
+                  'PhysicalResourceId': physical_id,
+                  'StackId': event.get('StackId', ''),
+                  'RequestId': event.get('RequestId', ''),
+                  'LogicalResourceId': event.get('LogicalResourceId', ''),
+                  'Data': data
+              }).encode('utf-8')
+              req = urllib.request.Request(url, data=body, method='PUT')
+              req.add_header('Content-Type', '')
+              req.add_header('Content-Length', str(len(body)))
+              urllib.request.urlopen(req)
 
   Boto3LayerCustomResource:
     Type: AWS::CloudFormation::CustomResource
+    DependsOn: Boto3LayerBuilder
     Properties:
       ServiceToken: !GetAtt Boto3LayerBuilder.Arn
 
@@ -172,16 +239,6 @@ Resources:
             Effect: "Allow"
             Sid: "AIAgentSupportAccess"
         PolicyName: "AIAgentSupportReadOnlyAccess"
-      - PolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-          - Resource: "*"
-            Action:
-              - "lambda:PublishLayerVersion"
-              - "lambda:GetLayerVersion"
-            Effect: "Allow"
-            Sid: "LambdaLayerAccess"
-        PolicyName: "LambdaLayerBuildAccess"
 
   # Lambda function with embedded code
   LambdaFunctionAmazonConnectOperationalReviewauto:
@@ -227,72 +284,65 @@ Resources:
           import time
           import re
           from collections import Counter
-          from typing import Dict, List, Optional, Any, Tuple
-          
+
           # Configure logging
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
-          
+
           # Format the datetime object into a string including the timezone name
           currentDateAndTime = datetime.now()
           datetime_string = currentDateAndTime.strftime("%Y-%m-%d %H:%M:%S %Z%z")
-          
+
           # Initialize Connect client
           connect_client = boto3.client('connect')
-          
+
           # Initialize S3 client
           s3_client = boto3.client('s3')  
-          
+
           # Initialize CloudWatch client
           cloudwatch_client = boto3.client('cloudwatch')
-          
-          # Initialize CloudWatch logs client
-          logs_client = boto3.client('logs')
-          
+
           # Initialize CloudTrail client
           cloudtrail_client = boto3.client('cloudtrail')    
 
           # Initialize Pinpoint client
           pinpoint_client = boto3.client('pinpoint')
-          
+
           # Initialize Service Quotas client
           service_quotas_client = boto3.client('service-quotas')
-          
-          # Initialize Q in Connect client for AI Agent checks
-          qconnect_client = boto3.client('qconnect')
-          
+
           """Parse instance_id and aws_region from Amazon Connect instance ARN"""
           def parse_connect_instance_arn(instance_arn):
               """
                   ARN format: arn:aws:connect:region:account-id:instance/instance-id
-          
+
               Args:
                   instance_arn (str): Amazon Connect instance ARN
-          
+
               Returns:
                   dict: Contains instance_id, aws_region, account_id, and other components
               """
-          
+
               if not instance_arn or not isinstance(instance_arn, str):
                   raise ValueError("Invalid ARN provided in envonment variable - CONNECT_INSTANCE_ARN")
-          
+
               # Split ARN by colons
               arn_parts = instance_arn.split(':')
-          
+
               if len(arn_parts) < 6 or arn_parts[0] != 'arn' or arn_parts[2] != 'connect':
                   raise ValueError(f"Invalid Connect instance ARN format: {instance_arn}")
-          
+
               # Extract components
               aws_region = arn_parts[3]
               account_id = arn_parts[4]
               resource_part = arn_parts[5]  # instance/instance-id
-          
+
               # Extract instance ID from resource part
               if not resource_part.startswith('instance/'):
                   raise ValueError(f"Invalid resource type in ARN: {resource_part}")
-          
+
               instance_id = resource_part.split('/', 1)[1]
-          
+
               return {
                   'instance_id': instance_id,
                   'aws_region': aws_region,
@@ -302,12 +352,12 @@ Resources:
                   'resource_type': 'instance',
                   'full_arn': instance_arn
               }
-          
+
           def get_connect_service_quota(service_quotas_client, service_code, quota_code, context_id=None):
               """
               Get a single service quota name and value with retry-on-throttle.
               Falls back to default if no instance-specific quota exists.
-          
+
               Returns:
                   tuple: (quota_name, quota_value)
               """
@@ -361,7 +411,8 @@ Resources:
               #    return "#FFFF00"  # Yellow - Caution
               else:
                   return "#00FF00"  # Green - Normal
-          
+
+          """Get Current utilization for Amazon Connect"""
           def count_paginated(client, method: str, list_key: str, **kwargs) -> int:
               """Generic paginator counter for any Connect list_* API."""
               total = 0
@@ -388,16 +439,16 @@ Resources:
           def current_utilization (instance_id: str, metric: str) -> int:
               """
               Return the current utilization count for a single metric.
-          
+
               Args:
                   instance_id: Amazon Connect instance id
                   metric: One of Users, ContactFlows, PhoneNumbers, Queues, RoutingProfiles,
                           SecurityProfiles, HoursOfOperation, QuickConnects, LexBotsV1, LexBotsV2
-          
+
               Returns:
                   int count, or raises ValueError for unknown metric
               """
-          
+
               metric_map = {
                   'Users':              lambda: count_paginated(connect_client, 'list_users',              'UserSummaryList',              InstanceId=instance_id),
                   'ContactFlows':       lambda: count_paginated(connect_client, 'list_contact_flows',      'ContactFlowSummaryList',       InstanceId=instance_id),
@@ -417,10 +468,10 @@ Resources:
                   'Notifications':      lambda: _count_manual(connect_client, 'list_notifications',      'NotificationSummaryList',      InstanceId=instance_id),
                   'Workspaces':         lambda: _count_manual(connect_client, 'list_workspaces',         'WorkspaceSummaryList',         InstanceId=instance_id),
               }
-          
+
               if metric not in metric_map:
                   raise ValueError(f"Unknown metric '{metric}'. Valid options: {list(metric_map.keys())}")
-          
+
               return metric_map[metric]()
 
 
@@ -455,96 +506,18 @@ Resources:
               return max_count
 
 
-          
-          
-          """class for segregating JSON data."""
-          class JSONSegregator:
-          
-              def __init__(self, data: List[Dict[str, Any]]):
-                  self.data = data
-          
-              def by_key(self, key: str, include_missing: bool = True) -> Dict[str, List[Dict]]:
-                  """Segregate by a single key."""
-                  result = defaultdict(list)
-          
-                  for item in self.data:
-                      if key in item:
-                          value = str(item[key])  # Convert to string for consistent keys
-                          result[value].append(item)
-                      elif include_missing:
-                          result['_missing'].append(item)
-          
-                  return dict(result)
-          
-              def by_value_range(self, key: str, ranges: List[tuple]) -> Dict[str, List[Dict]]:
-                  """Segregate by value ranges."""
-                  result = defaultdict(list)
-          
-                  for item in self.data:
-                      if key in item:
-                          value = item[key]
-                          assigned = False
-          
-                          for range_name, min_val, max_val in ranges:
-                              if min_val <= value < max_val:
-                                  result[range_name].append(item)
-                                  assigned = True
-                                  break
-          
-                          if not assigned:
-                              result['_out_of_range'].append(item)
-                      else:
-                          result['_missing_key'].append(item)
-          
-                  return dict(result)
-          
-              def by_custom_function(self, func) -> Dict[str, List[Dict]]:
-                  """Segregate using custom function."""
-                  result = defaultdict(list)
-          
-                  for item in self.data:
-                      try:
-                          group_key = func(item)
-                          result[str(group_key)].append(item)
-                      except Exception as e:
-                          result[f'_error_{type(e).__name__}'].append(item)
-          
-                  return dict(result)
-          
-          """Segregate data based on a specific JSON element/key."""
-          def segregate_by_json_element(data, key):
-              """
-              Args:
-                  data (list): List of dictionaries (JSON objects)
-                  key (str): The key to segregate by
-          
-              Returns:
-                  dict: Dictionary with segregated data
-              """
-              segregated = defaultdict(list)
-          
-              for item in data:
-                  if key in item:
-                      value = item[key]
-                      segregated[value].append(item)
-                  else:
-                      # Handle items without the key
-                      segregated['_missing_key'].append(item)
-          
-              return dict(segregated)
-          
           """Segregate data based on multiple JSON elements."""
           def segregate_by_multiple_criteria(data, criteria):
               """
               Args:
                   data (list): List of dictionaries
                   criteria (list): List of keys to create composite grouping
-          
+
               Returns:
                   dict: Dictionary with segregated data using composite keys
               """
               segregated = defaultdict(list)
-          
+
               for item in data:
                   # Create composite key from multiple criteria
                   key_parts = []
@@ -553,102 +526,12 @@ Resources:
                           key_parts.append(str(item[criterion]))
                       else:
                           key_parts.append('_missing')
-          
+
                   composite_key = ' | '.join(key_parts)
                   segregated[composite_key].append(item)
-          
+
               return dict(segregated)
-          
-          """Comprehensive analyze CloudWatch Metrics - Concurrent Calls"""
-          def summarize_concurrent_calls(instance_id, days_back):
-              html_content = f"<b>Summarize concurrent calls for Amazon Connect over the last {days_back} days</b><br>"
-          
-              # Calculate time range for last 2 weeks
-              end_time = datetime.utcnow() +  timedelta(days=1)
-              start_time = end_time - timedelta(days=1)
-          
-              logger.debug(f"\n Retrieving concurrent calls data from {start_time.date()} to {end_time.date()}")
-          
-              try:
-                  # Get concurrent calls metrics
-                  response = cloudwatch_client.get_metric_statistics(
-                      Namespace='AWS/Connect',
-                      MetricName='ConcurrentCalls',
-                      Dimensions=[
-                          {'Name': 'InstanceId', 'Value': instance_id}
-                      ],
-                      StartTime=start_time,
-                      EndTime=end_time,
-                      Period=3600,  # 1-hour periods for detailed analysis
-                      Statistics=['Average', 'Maximum', 'Minimum']
-                  )
-          
-                  # Process data by day
-                  daily_stats = defaultdict(lambda: {'hourly_avg': [], 'hourly_max': [], 'hourly_min': []})
-          
-                  for datapoint in response['Datapoints']:
-                      date = datapoint['Timestamp'].date()
-                      daily_stats[date]['hourly_avg'].append(datapoint['Average'])
-                      daily_stats[date]['hourly_max'].append(datapoint['Maximum'])
-                      daily_stats[date]['hourly_min'].append(datapoint['Minimum'])
-          
-                  # Calculate overall statistics
-                  all_averages = []
-                  all_maximums = []
-                  all_minimums = []
-          
-                  logger.debug(f"\n{'='*60}")
-                  logger.debug(f"CONCURRENT CALLS SUMMARY - LAST 2 WEEKS")
-                  logger.debug(f"Instance ID: {instance_id}")
-                  logger.debug(f"{'='*60}")
-          
-                  # Daily breakdown
-                  for date in sorted(daily_stats.keys()):
-                      stats = daily_stats[date]
-          
-                      daily_avg = sum(stats['hourly_avg']) / len(stats['hourly_avg'])
-                      daily_max = max(stats['hourly_max'])
-                      daily_min = min(stats['hourly_min'])
-          
-                      all_averages.extend(stats['hourly_avg'])
-                      all_maximums.extend(stats['hourly_max'])
-                      all_minimums.extend(stats['hourly_min'])
-          
-                      logger.debug(f"\n{date.strftime('%A, %B %d, %Y')}:")
-                      logger.debug(f"  Daily Average: {daily_avg:.2f} calls")
-                      logger.debug(f"  Peak (Maximum): {daily_max:.0f} calls")
-                      logger.debug(f"  Lowest (Minimum): {daily_min:.0f} calls")
-                      logger.debug(f"  Data points: {len(stats['hourly_avg'])} hours")
-          
-                  # Overall 2-week summary
-                  if all_averages:
-                      overall_avg = sum(all_averages) / len(all_averages)
-                      overall_max = max(all_maximums)
-                      overall_min = min(all_minimums)
-          
-                      logger.debug(f"\n{'='*60}")
-                      logger.debug(f"OVERALL 2-WEEK SUMMARY")
-                      logger.debug(f"{'='*60}")
-                      html_content += f"<br>Period Average: {overall_avg:.2f} concurrent calls"
-                      html_content += f"<br>Absolute Peak: {overall_max:.0f} concurrent calls"
-                      html_content += f"<br>Absolute Minimum: {overall_min:.0f} concurrent calls"
-                      html_content += f"<br>Total data points: {len(all_averages)} hours"
-          
-                      # Additional insights
-                      html_content += f"<br><br>INSIGHTS:"
-                      html_content += f"<br>- Average daily variation: {(overall_max - overall_min):.0f} calls"
-                      html_content += f"<br>- Peak utilization was {(overall_max / overall_avg - 1) * 100:.1f}% above average"
-          
-                  else:
-                      html_content += f"<br>No data available for the specified time period."
-                      logger.debug("\nNo data available for the specified time period.")
-          
-              except Exception as e:
-                  logger.error(f"Error retrieving metrics: {str(e)}")
-                  html_content = f"\nError retrieving metrics: {str(e)}"
-          
-              return html_content
-          
+
           """Comprehensive analyze of missed calls summary for Amazon Connect"""
           def summarize_missed_calls(instance_id, days_back):
               html_content = f"<p>Analyzing missed calls over the last {days_back} days.</p>"
@@ -656,10 +539,10 @@ Resources:
               # Calculate time range for last 2 weeks
               end_time = datetime.utcnow()
               start_time = end_time - timedelta(days_back)
-          
+
               logger.debug(f"Retrieving missed calls data from {start_time.date()} to {end_time.date()}")
               logger.debug(f"Instance ID: {instance_id}")
-          
+
               try:
                   # Get missed calls metrics with daily granularity
                   response = cloudwatch_client.get_metric_statistics(
@@ -674,28 +557,28 @@ Resources:
                       Period=86400,  # Daily statistics (24 hours)
                       Statistics=['Sum']
                   )
-          
+
                   # Process daily data
                   daily_data = []
                   total_missed_calls = 0
-          
+
                   for datapoint in sorted(response['Datapoints'], key=lambda x: x['Timestamp']):
                       date = datapoint['Timestamp'].date()
                       missed_calls = int(datapoint['Sum'])
                       total_missed_calls += missed_calls
                       daily_data.append((date, missed_calls))
-          
+
                   logger.debug(f"\n{'='*60}")
                   logger.debug(f"MISSED CALLS SUMMARY - LAST 2 WEEKS")
                   logger.debug(f"{'='*60}")
-          
+
                   # Daily breakdown
                   logger.debug(f"\nDAILY BREAKDOWN:")
                   logger.debug(f"{'-'*40}")
                   for date, count in daily_data:
                       day_name = date.strftime('%A')
                       logger.debug(f"{date} ({day_name}): {count:,} missed calls")
-          
+
                   # Calculate statistics
                   if daily_data:
                       missed_calls_counts = [count for _, count in daily_data]
@@ -703,10 +586,10 @@ Resources:
                       daily_median = statistics.median(missed_calls_counts)
                       max_missed = max(missed_calls_counts)
                       min_missed = min(missed_calls_counts)
-          
+
                       # Find peak day
                       peak_day = max(daily_data, key=lambda x: x[1])
-          
+
                       logger.debug(f"\n{'='*60}")
                       logger.debug(f"SUMMARY STATISTICS")
                       logger.debug(f"{'='*60}")
@@ -724,163 +607,38 @@ Resources:
                       # Weekly comparison
                       week1_data = [count for date, count in daily_data if date < start_time.date() + timedelta(days=7)]
                       week2_data = [count for date, count in daily_data if date >= start_time.date() + timedelta(days=7)]
-          
+
                       if week1_data and week2_data:
                           week1_total = sum(week1_data)
                           week2_total = sum(week2_data)
                           week1_avg = statistics.mean(week1_data)
                           week2_avg = statistics.mean(week2_data)
-          
+
                           change_percent = ((week2_total - week1_total) / week1_total) * 100 if week1_total > 0 else 0
-          
+
                           logger.debug(f"\n{'='*60}")
                           logger.debug(f"WEEKLY COMPARISON")
                           logger.debug(f"{'='*60}")
                           logger.debug(f"Week 1 total: {week1_total:,} missed calls (avg: {week1_avg:.1f}/day)")
                           logger.debug(f"Week 2 total: {week2_total:,} missed calls (avg: {week2_avg:.1f}/day)")
                           logger.debug(f"Week-over-week change: {change_percent:+.1f}%")
-          
+
                           if change_percent > 10:
                               logger.debug("⚠️  Significant increase in missed calls detected!")
                           elif change_percent < -10:
                               logger.debug("✅ Significant improvement in missed calls!")
-          
+
                   else:
                       logger.debug("No missed calls data available for the specified time period.")
                       html_content+=f"<p>No missed calls data available for the specified time period.</p>"
                   if daily_data and statistics.mean([c for _, c in daily_data]) > 5:
                       html_content += get_recommendation("missed_calls")
                   return html_content
-          
+
               except Exception as e:
                   logger.error(f"Error retrieving metrics: {str(e)}")
                   html_content+=f"<br>Error retrieving metrics: {str(e)}"
-          
-          """Comprehensive analysis of ThrottledCalls for Amazon Connect"""
-          def summarize_throttled_calls(instance_id, days_back):
-              html_content = f"<b>Summarize throttled calls for Amazon Connect over the last {days_back} days</b><br>"
-          
-              # Calculate time range
-              end_time = datetime.utcnow()
-              start_time = end_time - timedelta(days=days_back)
-          
-              logger.debug(f"Analyzing ThrottledCalls from {start_time.date()} to {end_time.date()}")
-              logger.debug(f"Instance ID: {instance_id}")
-          
-              try:
-                  # Get ThrottledCalls metrics
-                  response = cloudwatch_client.get_metric_statistics(
-                      Namespace='AWS/Connect',
-                      MetricName='ThrottledCalls',
-                      Dimensions=[
-                          {'Name': 'InstanceId', 'Value': instance_id},
-                          {'Name': 'MetricGroup', 'Value': 'VoiceCalls'}
-                      ],
-                      StartTime=start_time,
-                      EndTime=end_time,
-                      Period=3600,  # 1-hour intervals
-                      Statistics=['Sum', 'Maximum']
-                  )
-          
-                  datapoints = response['Datapoints']
-          
-                  if not datapoints:
-                      logger.debug("✅ No throttled calls found in the specified time period!")
-                      logger.debug("This indicates your instance is operating within capacity limits.")
-                      html_content+=f"<br>No throttled calls found in the specified time period!"
-                      html_content+=f"<br>Your instance is operating well within capacity limits"
-                      return html_content
-          
-                  # Sort datapoints by timestamp
-                  sorted_data = sorted(datapoints, key=lambda x: x['Timestamp'])
-          
-                  logger.debug(f"\n{'='*70}")
-                  logger.debug(f"THROTTLED CALLS ANALYSIS - LAST {days_back} DAYS")
-                  logger.debug(f"{'='*70}")
-          
-                  # Calculate overall statistics
-                  total_throttled = sum(int(dp['Sum']) for dp in sorted_data)
-                  hourly_counts = [int(dp['Sum']) for dp in sorted_data]
-                  max_hourly = max(hourly_counts)
-                  avg_hourly = statistics.mean(hourly_counts) if hourly_counts else 0
-          
-                  logger.debug(f"\nOVERALL STATISTICS:")
-                  logger.debug(f"  Total throttled calls: {total_throttled:,}")
-                  logger.debug(f"  Average per hour: {avg_hourly:.2f}")
-                  logger.debug(f"  Maximum in single hour: {max_hourly:,}")
-                  logger.debug(f"  Hours with throttling: {len([c for c in hourly_counts if c > 0])}")
-                  logger.debug(f"  Total hours analyzed: {len(hourly_counts)}")
-          
-                  # Severity assessment
-                  logger.debug(f"\nSEVERITY ASSESSMENT:")
-                  if total_throttled == 0:
-                      logger.debug("  ✅ EXCELLENT - No throttling detected")
-                  elif total_throttled < 10:
-                      logger.debug("  ⚠️  LOW - Minimal throttling (< 10 calls)")
-                  elif total_throttled < 100:
-                      logger.debug("  ⚠️  MODERATE - Some throttling detected (< 100 calls)")
-                  elif total_throttled < 1000:
-                      logger.debug("  ❌ HIGH - Significant throttling (< 1000 calls)")
-                  else:
-                      logger.debug("  🚨 CRITICAL - Severe throttling (> 1000 calls)")
-                      logger.debug("     IMMEDIATE ACTION REQUIRED!")
-          
-                  # Daily breakdown
-                  daily_stats = defaultdict(int)
-                  for dp in sorted_data:
-                      date = dp['Timestamp'].date()
-                      daily_stats[date] += int(dp['Sum'])
-          
-                  logger.debug(f"\nDAILY BREAKDOWN:")
-                  logger.debug(f"{'-'*50}")
-                  for date in sorted(daily_stats.keys()):
-                      count = daily_stats[date]
-                      day_name = date.strftime('%A')
-                      status = "🚨" if count > 100 else "⚠️" if count > 10 else "✅" if count == 0 else "⚠️"
-                      logger.debug(f"  {date} ({day_name}): {count:,} throttled calls {status}")
-          
-                  # Peak hours analysis
-                  peak_hours = sorted(sorted_data, key=lambda x: x['Sum'], reverse=True)[:5]
-                  if peak_hours and peak_hours[0]['Sum'] > 0:
-                      logger.debug(f"\nTOP 5 PEAK THROTTLING HOURS:")
-                      logger.debug(f"{'-'*50}")
-                      for i, dp in enumerate(peak_hours, 1):
-                          if dp['Sum'] > 0:
-                              timestamp = dp['Timestamp'].strftime('%Y-%m-%d %H:%M UTC')
-                              print(f"  {i}. {timestamp}: {int(dp['Sum']):,} throttled calls")
-          
-                  # Recommendations
-                  print(f"\n{'='*70}")
-                  print(f"RECOMMENDATIONS")
-                  print(f"{'='*70}")
-          
-                  if total_throttled > 0:
-                      logger.debug("🔧 IMMEDIATE ACTIONS:")
-                      logger.debug("  1. Review current service quotas for your Connect instance")
-                      logger.debug("  2. Consider requesting quota increases via AWS Support")
-                      logger.debug("  3. Analyze call patterns during peak throttling periods")
-                      logger.debug("  4. Implement call queuing or retry mechanisms")
-          
-                      logger.debug("\n📊 MONITORING IMPROVEMENTS:")
-                      logger.debug("  1. Set up CloudWatch alarms for ThrottledCalls metric")
-                      logger.debug("  2. Monitor ConcurrentCalls to predict throttling")
-                      logger.debug("  3. Track CallsPerInterval for capacity planning")
-          
-                      logger.debug("\n⚡ CAPACITY OPTIMIZATION:")
-                      logger.debug("  1. Distribute call load across multiple instances if possible")
-                      logger.debug("  2. Implement intelligent call routing")
-                      logger.debug("  3. Consider auto-scaling strategies for peak periods")
-                  else:
-                      logger.debug("✅ Your instance is operating well within capacity limits!")
-                      logger.debug("   Continue monitoring to ensure consistent performance.")
-                      html_content+=f"Your instance is operating well within capacity limits"
-                      html_content+=f"Continue monitoring to ensure consistent performance."
-                  return html_content
-          
-              except Exception as e:
-                  logger.error(f"❌ Error retrieving ThrottledCalls metrics: {str(e)}")
-                  html_content+=f"<br>Error retrieving metrics: {str(e)}"
-          
+
           """Lookup CloudTrail events for Amazon Connect"""
           def lookup_connect_cloudtrail_events(account_id, days_back, aws_region, max_seconds=120):
               """
@@ -916,16 +674,8 @@ Resources:
                       }
                   ]
 
-                  # Add instance-specific filter if provided
-                 # if instance_id:
-                 #     lookup_attributes.append({
-                 #         'AttributeKey': 'ResourceName',
-                 #         'AttributeValue': instance_id
-                 #     })
-
-                  # Lookup events
                   paginator = cloudtrail_client.get_paginator('lookup_events')
-          
+
                   for page in paginator.paginate(
                       LookupAttributes=lookup_attributes,
                       StartTime=start_time,
@@ -951,10 +701,10 @@ Resources:
 
           """Parse and enrich Connect CloudTrail event"""
           def parse_connect_event(event):
-          
+
               try:
                   cloud_trail_event = json.loads(event.get('CloudTrailEvent', '{}'))
-          
+
                   # Extract key information
                   event_data = {
                       'eventId': event.get('EventId'),
@@ -972,13 +722,13 @@ Resources:
                       'errorCode': cloud_trail_event.get('errorCode'),
                       'errorMessage': cloud_trail_event.get('errorMessage')
                   }
-          
+
                   return event_data
-          
+
               except Exception as e:
                   print(f"Error parsing event: {e}")
                   return None
-          
+
           """Comprehensive analysis of Amazon Connect API Throttles"""
           def summarize_amazon_api_throttles(instance_id, account_id, days_back, aws_region, max_seconds=120):
 
@@ -998,31 +748,15 @@ Resources:
                   # Use a defaultdict to store counts for each category
                   category_counts = defaultdict(int)
                   total_throttled_count = 0
-          
-                  # Iterate through the data and count by category
+
                   for item in events:
                       category = item.get("eventName")
-          
                       if item.get("errorCode") == 'TooManyRequestsException' and item.get("awsRegion") == aws_region:
                           category_counts[category] += 1
                           total_throttled_count += 1
 
                   html_content += f"""<p>Found <strong>{total_throttled_count}</strong> throttled API calls in account {escape(account_id)}, region {escape(aws_region)}.</p>"""
 
-          
-                  ## Summary of the output
-                  ##html_content += f"""<br>Found {total_throttled_count} Amazon Connect events which are being throttled in account - {account_id} and region - {aws_region} <br>"""
-          
-                  # Print the segregated counts
-                  html_content += f"""<br>
-                              <table style="width: 50%">
-                              <tr><th>Event Name</th><th>Throttle Count</th></tr>"""
-          
-                  for category, count in category_counts.items():
-                      html_content += f"""<tr><td>{category}</td><td>{count}</td></tr>"""
-          
-                  html_content += f"""</table>"""
-          
                   if total_throttled_count > 0:
                       html_content += f"""
                           <table style="width: 60%">
@@ -1035,15 +769,13 @@ Resources:
                       html_content += """<p style="color:#22c55e;">&#9989; No API throttling detected during this period.</p>"""
 
                   return html_content
-          
+
               except Exception as e:
                   logger.error(f"Error retrieving Amazon Connect API throttling metrics: {str(e)}")
                   return f"<p style='color:#ef4444;'>Error retrieving API throttling summary. Check the logs.</p>"
 
           """HTML Report upload to S3 bucket"""
           def upload_string_to_s3(string_data, bucket_name, object_key, content_type):
-              s3_client = boto3.client('s3')
-
               try:
                   response = s3_client.put_object(
                       Bucket=bucket_name,
@@ -1056,14 +788,14 @@ Resources:
               except ClientError as e:
                   print(f"Error uploading to S3: {e}")
                   return False
-          
+
           """Get Connect Instance Details"""
           def describe_connect_to_html(instance_id):
               try:
                   # Describe the instance
                   response = connect_client.describe_instance(InstanceId=instance_id)
                   instance = response['Instance']
-          
+
                   # Generate HTML
                   html_content = f"""
                   <!DOCTYPE html>
@@ -1249,52 +981,6 @@ Resources:
                           .back-to-top:hover {{
                               background: var(--aws-orange);
                           }}
-                          /* Collapsible sections */
-                          .section-header {{
-                              display: flex;
-                              align-items: center;
-                              cursor: pointer;
-                              user-select: none;
-                          }}
-                          .section-header:hover {{
-                              opacity: 0.8;
-                          }}
-                          .toggle-arrow {{
-                              display: inline-block;
-                              width: 20px;
-                              font-size: 0.8rem;
-                              color: var(--text-light);
-                              transition: transform 0.2s;
-                              flex-shrink: 0;
-                          }}
-                          .toggle-arrow.collapsed {{
-                              transform: rotate(-90deg);
-                          }}
-                          .section-body {{
-                              transition: max-height 0.3s ease;
-                              overflow: hidden;
-                          }}
-                          .section-body.collapsed {{
-                              display: none;
-                          }}
-                          .expand-controls {{
-                              display: flex;
-                              gap: 8px;
-                              margin: 0 0 16px 0;
-                          }}
-                          .expand-btn {{
-                              padding: 6px 14px;
-                              border: 1px solid var(--border);
-                              border-radius: 6px;
-                              background: var(--card-bg);
-                              color: var(--text);
-                              font-size: 0.8rem;
-                              cursor: pointer;
-                              font-weight: 600;
-                          }}
-                          .expand-btn:hover {{
-                              background: #f1f5f9;
-                          }}
                       </style>
                   </head>
                   <body>
@@ -1309,57 +995,12 @@ Resources:
                               }}
                           }});
                       </script>
-                      <script>
-                      function toggleSection(el) {{
-                          var body = el.parentElement.querySelector('.section-body');
-                          var arrow = el.querySelector('.toggle-arrow');
-                          if (body.classList.contains('collapsed')) {{
-                              body.classList.remove('collapsed');
-                              arrow.classList.remove('collapsed');
-                          }} else {{
-                              body.classList.add('collapsed');
-                              arrow.classList.add('collapsed');
-                          }}
-                      }}
-                      function expandAll() {{
-                          document.querySelectorAll('.section-body.collapsed').forEach(function(el) {{
-                              el.classList.remove('collapsed');
-                          }});
-                          document.querySelectorAll('.toggle-arrow.collapsed').forEach(function(el) {{
-                              el.classList.remove('collapsed');
-                          }});
-                      }}
-                      function collapseAll() {{
-                          document.querySelectorAll('.section-body').forEach(function(el) {{
-                              el.classList.add('collapsed');
-                          }});
-                          document.querySelectorAll('.toggle-arrow').forEach(function(el) {{
-                              el.classList.add('collapsed');
-                          }});
-                      }}
-                      var _allExpanded = true;
-                      function toggleAll() {{
-                          var btn = document.getElementById('toggleAllBtn');
-                          if (_allExpanded) {{
-                              collapseAll();
-                              btn.innerHTML = '&#9660; Expand All';
-                              _allExpanded = false;
-                          }} else {{
-                              expandAll();
-                              btn.innerHTML = '&#9650; Collapse All';
-                              _allExpanded = true;
-                          }}
-                      }}
-                      </script>
                       <div class="report-header">
                           <h1>Amazon Contact Center - Operations Review</h1>
                           <div class="subtitle">Automated operational health assessment</div>
                           <div class="generated">Generated on: {escape(datetime_string)} UTC</div>
                       </div>
                       <div class="container">
-                      <div class="expand-controls">
-                          <button class="expand-btn" id="toggleAllBtn" onclick="toggleAll()">&#9650; Collapse All</button>
-                      </div>
                       <!--SUMMARY_PLACEHOLDER-->
                       <div class="section">
                           <h2>Amazon Connect Instance Information</h2>
@@ -1375,7 +1016,7 @@ Resources:
                           </table>
                       </div>
                   """
-          
+
                   # Add inbound/outbound calls configuration
                   if 'InboundCallsEnabled' in instance or 'OutboundCallsEnabled' in instance:
                       html_content += """
@@ -1388,11 +1029,11 @@ Resources:
                       if 'OutboundCallsEnabled' in instance:
                           html_content += f"<tr><th>Outbound Calls Enabled</th><td>{escape(str(instance['OutboundCallsEnabled']))}</td></tr>"
                       html_content += "</table></div>"
-          
-                      logger.debug(f"\n REPLICATION CONFIGURATION:")
+
+                      logger.debug(f"\n🔄 REPLICATION CONFIGURATION:")
                       html_content += """<div class="section">
                           <h3>Replication Configuration</h3>"""
-          
+
                   # Replication configuration (if available)
                       if 'ReplicationConfiguration' in response:
                           replication = response['ReplicationConfiguration']
@@ -1403,7 +1044,7 @@ Resources:
                               <tr><th>Replication Status Message</th><td>{escape(replication.get('ReplicationStatusMessage', 'N/A'))}</td></tr>
                           </table>
                           </div>"""
-          
+
                       else:
                           html_content += """<p>No replication configuration available.</p></div>"""
                           logger.debug("No replication configuration available.")
@@ -1425,6 +1066,7 @@ Resources:
           """Get all phone numbers for the instance - single pass for both details and type counts"""
           def get_phone_numbers_with_basic_details(connect_client, instance_id):
               """Get all phone numbers with basic information and type counts in a single paginated scan."""
+
               phone_numbers = []
               phone_type_counts = {
                   'TOLL_FREE': 0, 'DID': 0, 'UIFN': 0, 'SHARED': 0,
@@ -1433,28 +1075,35 @@ Resources:
               country_counts = Counter()
               status_counts = Counter()
               total_numbers = 0
+
               try:
                   paginator = connect_client.get_paginator('list_phone_numbers_v2')
+
                   for page in paginator.paginate(InstanceId=instance_id):
                       for number_summary in page.get('ListPhoneNumbersSummaryList', []):
                           total_numbers += 1
                           phone_type = number_summary.get('PhoneNumberType', 'UNKNOWN')
                           country_code = number_summary.get('PhoneNumberCountryCode', 'UNKNOWN')
+
+                          # Count by type
                           if phone_type in phone_type_counts:
                               phone_type_counts[phone_type] += 1
                           country_counts[country_code] += 1
+
                           try:
                               detailed_info = connect_client.describe_phone_number(
-                                  PhoneNumberId=number_summary['PhoneNumberId'])
+                                  PhoneNumberId=number_summary['PhoneNumberId']
+                              )
                               raw_status = detailed_info['ClaimedPhoneNumberSummary'].get('PhoneNumberStatus', 'UNKNOWN')
                               status = raw_status.get('Status', 'UNKNOWN') if isinstance(raw_status, dict) else raw_status
                               status_counts[status] += 1
-                              phone_number_carrier = validate_phone_number_for_connect(
-                                  number_summary['PhoneNumber'], country_code).get('carrier', 'Unknown')
+
+                              phone_number_carrier = validate_phone_number_for_connect(number_summary['PhoneNumber'], country_code).get('carrier', 'Unknown')
                           except Exception as e:
                               logger.error(f"Error getting details for phone number {number_summary.get('PhoneNumber', '')}: {str(e)}")
                               status_counts['UNKNOWN'] += 1
                               phone_number_carrier = 'Unknown'
+
                           phone_numbers.append({
                               "phone_number_id": number_summary['PhoneNumberId'],
                               "phone_number": number_summary['PhoneNumber'],
@@ -1462,6 +1111,8 @@ Resources:
                               "phone_number_country_code": country_code,
                               "phone_number_carrier": phone_number_carrier,
                           })
+                          logger.debug(f"Phone Number: {number_summary['PhoneNumber']} Type: {phone_type} Carrier: {phone_number_carrier}")
+
                   phone_type_counts['_metadata'] = {
                       'total_numbers': total_numbers,
                       'country_distribution': dict(country_counts),
@@ -1469,22 +1120,24 @@ Resources:
                       'countries_count': len(country_counts),
                       'most_common_country': country_counts.most_common(1)[0] if country_counts else None
                   }
+
                   return phone_numbers, phone_type_counts
+
               except Exception as e:
                   logger.error(f"Error listing phone numbers: {str(e)}")
                   phone_type_counts['_metadata'] = {'total_numbers': 0, 'country_distribution': {}, 'status_distribution': {}, 'countries_count': 0, 'most_common_country': None}
                   return [], phone_type_counts
-          
+
           """Analyze Carrier Diversity"""
           def validate_phone_number_for_connect(phone_number, iso_country_code=None):
               """
               Validate a phone number using Amazon Pinpoint Phone Number Validation API
               to get service provider information for Amazon Connect phone numbers.
-          
+
               Args:
                   phone_number (str): The phone number to validate (include country code)
                   iso_country_code (str, optional): Two-character ISO 3166-1 alpha-2 country code
-          
+
               Returns:
                   dict: Phone number validation response with carrier and other details
               """
@@ -1495,17 +1148,17 @@ Resources:
                           'PhoneNumber': phone_number
                       }
                   }
-          
+
                   # Add country code if provided
                   if iso_country_code:
                       request_params['NumberValidateRequest']['IsoCountryCode'] = iso_country_code
-          
+
                   # Call the phone number validation API
                   response = pinpoint_client.phone_number_validate(**request_params)
-          
+
                   # Extract validation details
                   validation_result = response['NumberValidateResponse']
-          
+
                   # Format the result for easy consumption
                   result = {
                       'original_number': validation_result.get('OriginalPhoneNumber'),
@@ -1522,13 +1175,13 @@ Resources:
                       'zip_code': validation_result.get('ZipCode'),
                       'is_valid': validation_result.get('PhoneType') != 'INVALID'
                   }
-          
+
                   return result
-          
+
               except ClientError as e:
                   error_code = e.response['Error']['Code']
                   error_message = e.response['Error']['Message']
-          
+
                   return {
                       'error': True,
                       'error_code': error_code,
@@ -1553,157 +1206,6 @@ Resources:
               Returns:
                   tuple: (flows_without_logging list, skipped_flows list, was_capped bool)
               """
-          
-          """Get Amazon Connect CloudWatch Metrics"""
-          def get_connect_metric_simple(instance_id, metric_name, days_back):
-              """
-              Simple function to get a specific Amazon Connect metric
-              """
-          
-              end_time = datetime.utcnow()
-              start_time = end_time - timedelta(days=days_back)
-          
-              try:
-                  response = cloudwatch_client.get_metric_statistics(
-                      Namespace='AWS/Connect',
-                      MetricName=metric_name,
-                      Dimensions=[
-                          {'Name': 'InstanceId', 'Value': instance_id},
-                          {'Name': 'MetricGroup', 'Value': 'VoiceCalls'}
-                      ],
-                      StartTime=start_time,
-                      EndTime=end_time,
-                      Period=3600,  # 1 hour
-                      Statistics=['Sum', 'Average', 'Maximum']
-                  )
-          
-                  datapoints = response['Datapoints']
-          
-                  if datapoints:
-                      # Sort by timestamp
-                      datapoints.sort(key=lambda x: x['Timestamp'])
-          
-                      logger.debug(f"📊 {metric_name} (last {days_back} days):")
-          
-                      if 'Sum' in datapoints[0]:
-                          total = sum(dp.get('Sum', 0) for dp in datapoints)
-                          logger.debug(f"   Total: {total:.0f}")
-          
-                      if 'Average' in datapoints[0]:
-                          avg_values = [dp.get('Average', 0) for dp in datapoints]
-                          overall_avg = sum(avg_values) / len(avg_values)
-                          logger.debug(f"   Average: {overall_avg:.2f}")
-          
-                      if 'Maximum' in datapoints[0]:
-                          max_values = [dp.get('Maximum', 0) for dp in datapoints]
-                          peak = max(max_values)
-                          logger.debug(f"   Peak: {peak:.0f}")
-          
-                      return datapoints
-                  else:
-                      logger.debug(f"No data found for {metric_name}")
-                      return []
-          
-              except Exception as e:
-                  logger.error(f"Error getting {metric_name}: {str(e)}")
-                  return []
-          
-          """Get Amazon Connect Flows"""
-          def get_contact_flows(instance_id):
-              """Get all contact flows for the instance"""
-          
-              try:
-                  contact_flows = {}
-                  paginator = connect_client.get_paginator('list_contact_flows')
-          
-                  for page in paginator.paginate(InstanceId=instance_id):
-                      for flow in page['ContactFlowSummaryList']:
-                          contact_flows[flow['Id']] = {
-                              'name': flow['Name'],
-                              'type': flow['ContactFlowType'],
-                              'arn': flow['Arn']
-                          }
-          
-                  return contact_flows
-          
-              except Exception as e:
-                  logger.debug(f"Error getting contact flows: {str(e)}")
-                  return {}
-          
-          """Log Insights Query"""
-          def run_log_insights_query(logs_client, log_group, query, start_time, end_time):
-              """Execute CloudWatch Log Insights query"""
-          
-              try:
-                  # Start the query
-                  response = logs_client.start_query(
-                      logGroupName=log_group,
-                      startTime=int(start_time.timestamp()),
-                      endTime=int(end_time.timestamp()),
-                      queryString=query
-                  )
-          
-                  query_id = response['queryId']
-          
-                  # Wait for query to complete
-                  max_attempts = 30
-                  attempt = 0
-          
-                  while attempt < max_attempts:
-                      time.sleep(2)
-          
-                      result = logs_client.get_query_results(queryId=query_id)
-          
-                      if result['status'] == 'Complete':
-                          return result['results']
-                      elif result['status'] == 'Failed':
-                          raise Exception(f"Query failed: {result.get('statistics', {})}")
-          
-                      attempt += 1
-          
-                  raise Exception("Query timeout")
-          
-              except Exception as e:
-                  logger.error(f"Error running query: {str(e)}")
-                  return []
-          
-          """Contact Flow Errors"""
-          def analyze_contact_flow_errors(logs_client, instance_id, start_time, end_time, contact_flows):
-              """Analyze contact flow errors using CloudWatch Log Insights"""
-          
-              # Query for all contact flow errors
-              error_query = """
-              fields @timestamp, ContactId, ContactFlowId, ContactFlowModuleType, LogLevel, Message, Parameters
-              | filter LogLevel = "ERROR"
-              | stats count() as ErrorCount by ContactFlowId, ContactFlowModuleType, Message
-              | sort ErrorCount desc
-              """
-          
-              try:
-                  error_results = run_log_insights_query(logs_client, log_group, error_query, start_time, end_time)
-          
-                  # Query for detailed error information
-                  detailed_error_query = """
-                  fields @timestamp, ContactId, ContactFlowId, ContactFlowModuleType, LogLevel, Message, Parameters
-                  | filter LogLevel = "ERROR"
-                  | sort @timestamp desc
-                  | limit 100
-                  """
-          
-                  detailed_errors = run_log_insights_query(logs_client, log_group, detailed_error_query, start_time, end_time)
-          
-                  # Process and categorize errors
-                  processed_errors = process_error_results(error_results, detailed_errors, contact_flows)
-          
-                  return processed_errors
-          
-              except Exception as e:
-                  logger.error(f"Error analyzing contact flow errors: {str(e)}")
-                  return {}
-          
-          """Find contact flows where 'Set logging behavior' block is not enabled (set to TRUE)"""
-          def find_flows_without_logging_enabled(instance_id):
-          
               flows_without_logging = []
               skipped_flows = []
               skip_prefixes = ('default ', 'sample ')
@@ -1713,7 +1215,7 @@ Resources:
               try:
                   paginator = connect_client.get_paginator('list_contact_flows')
                   page_iterator = paginator.paginate(InstanceId=instance_id)
-          
+
                   for page in page_iterator:
                       for flow_summary in page['ContactFlowSummaryList']:
                           flow_id = flow_summary['Id']
@@ -1736,7 +1238,7 @@ Resources:
                               continue  # Keep counting skipped flows but stop analyzing
 
                           logger.debug(f"Analyzing flow: {flow_name} (ID: {flow_id})")
-          
+
                           try:
                               # Rate limit: ~8 TPS to stay under 10 TPS DescribeContactFlow limit
                               time.sleep(0.12)
@@ -1744,16 +1246,10 @@ Resources:
                                   InstanceId=instance_id,
                                   ContactFlowId=flow_id
                               )
-          
-                              # Parse the flow content (JSON string)
                               flow_content = json.loads(flow_details['ContactFlow']['Content'])
-          
-                              # Check if logging is enabled in this flow
                               logging_enabled = check_logging_behavior_in_flow(flow_content)
                               analyzed_count += 1
 
-                              logger.debug(f"logging_enabled: {logging_enabled}")
-          
                               if not logging_enabled:
                                   flows_without_logging.append({
                                       'FlowId': flow_id,
@@ -1763,15 +1259,12 @@ Resources:
                                       'Status': flow_summary.get('ContactFlowStatus', ''),
                                       'State': flow_summary.get('ContactFlowState', '')
                                   })
-                                  logger.debug(f"❌ Logging is not enabled for flow: {flow_name} (ID: {flow_id})")
-                              else :
-                                  logger.debug(f"✅ Logging is enabled for flow: {flow_name} (ID: {flow_id})")
-          
+
                           except Exception as e:
                               logger.error(f"Error analyzing flow {flow_name}: {str(e)}")
                               analyzed_count += 1
                               continue
-          
+
               except Exception as e:
                   logger.error(f"Error listing contact flows: {str(e)}")
                   return [], [], False
@@ -1780,29 +1273,29 @@ Resources:
 
           """Check if the flow contains a 'Set logging behavior' block with logging enabled"""
           def check_logging_behavior_in_flow(flow_content):
-          
+
               state = False
-          
+
               # Look for actions in the flow content
               actions = flow_content.get('Actions', [])
-          
+
               for action in actions:
                   # Check if this is a Set logging behavior block
                   action_type = action.get('Type', '')
                   if action_type == 'UpdateFlowLoggingBehavior':
-          
+
                       # Check the parameters to see if logging is enabled
                       parameters = action.get('Parameters', {})
                       logging_behavior = parameters.get('FlowLoggingBehavior', '')
                       logger.debug(f"parameters: {parameters}")
                       logger.debug(f"logging_behavior: {logging_behavior}")
-          
+
                       # If LoggingBehavior is set to 'Enable', then logging is enabled
                       if logging_behavior == 'Enabled':
                           state = True
                           logger.debug(f"action_type: {action_type}")
                           break  # Stop searching once we find a logging block that is enabled
-          
+
               # If no SetLoggingBehavior block found or none are enabled
               return state
 
@@ -2059,1014 +1552,6 @@ Resources:
               return ""
 
 
-          
-          
-          # ============================================================================
-          # AI AGENT CHECK FUNCTIONS - Phase 1 (13 Checks)
-          # ============================================================================
-          
-          """Paginate any qconnect/bedrock list API safely"""
-          def paginate_api_call(client_method, result_key, **kwargs):
-              all_items = []
-              try:
-                  logger.info(f"[PAGINATE] Calling {client_method.__name__} with result_key={result_key}, kwargs={kwargs}")
-                  response = client_method(**kwargs)
-                  items = response.get(result_key, [])
-                  logger.info(f"[PAGINATE] First page returned {len(items)} items for key '{result_key}'")
-                  logger.debug(f"[PAGINATE] Response keys: {list(response.keys())}")
-                  all_items.extend(items)
-                  page_count = 1
-                  while response.get('nextToken'):
-                      page_count += 1
-                      response = client_method(nextToken=response['nextToken'], **kwargs)
-                      items = response.get(result_key, [])
-                      logger.info(f"[PAGINATE] Page {page_count} returned {len(items)} items")
-                      all_items.extend(items)
-                  logger.info(f"[PAGINATE] Total: {len(all_items)} items across {page_count} page(s)")
-              except ClientError as e:
-                  logger.error(f"[PAGINATE] ClientError for {result_key}: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
-              except Exception as e:
-                  logger.error(f"[PAGINATE] Unexpected error for {result_key}: {type(e).__name__}: {e}")
-              return all_items
-          
-          """Discover Assistant ID from Connect instance integration associations"""
-          def discover_assistant_id(instance_id):
-              try:
-                  logger.info(f"[DISCOVER] Attempting to discover assistant ID for instance: {instance_id}")
-                  response = connect_client.list_integration_associations(
-                      InstanceId=instance_id,
-                      IntegrationType='WISDOM_ASSISTANT'
-                  )
-                  associations = response.get('IntegrationAssociationSummaryList', [])
-                  logger.info(f"[DISCOVER] Found {len(associations)} WISDOM_ASSISTANT integration(s)")
-                  for i, assoc in enumerate(associations):
-                      logger.info(f"[DISCOVER] Association[{i}]: IntegrationArn={assoc.get('IntegrationArn', 'N/A')}, "
-                                  f"IntegrationType={assoc.get('IntegrationType', 'N/A')}, "
-                                  f"IntegrationAssociationId={assoc.get('IntegrationAssociationId', 'N/A')}")
-                  if associations:
-                      assistant_arn = associations[0].get('IntegrationArn', '')
-                      assistant_id = assistant_arn.split('/')[-1] if '/' in assistant_arn else ''
-                      logger.info(f"[DISCOVER] Auto-discovered Assistant ID: {assistant_id} from ARN: {assistant_arn}")
-                      return assistant_id
-                  logger.warning("[DISCOVER] No WISDOM_ASSISTANT integration found for this instance. "
-                                "Check: 1) Is Q in Connect enabled? 2) Is an assistant associated with this instance?")
-                  return None
-              except ClientError as e:
-                  logger.error(f"[DISCOVER] ClientError: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
-                  return None
-              except Exception as e:
-                  logger.error(f"[DISCOVER] Unexpected error: {type(e).__name__}: {e}")
-                  return None
-          
-          """C1: AI Agent Inventory & Status"""
-          def check_ai_agent_inventory(assistant_id, instance_id):
-              html = "<b>AI Agent Inventory</b><br>"
-              logger.info(f"[O1] Starting AI Agent Inventory check for assistant_id={assistant_id}")
-              try:
-                  agents = paginate_api_call(qconnect_client.list_ai_agents, 'aiAgentSummaries', assistantId=assistant_id, maxResults=100)
-                  logger.info(f"[O1] list_ai_agents returned {len(agents)} agent(s)")
-                  if not agents:
-                      logger.warning(f"[O1] No AI agents found for assistant {assistant_id}")
-                      html += "<br>No AI agents configured for this assistant."
-                      html += """<h4>Recommendation</h4><ul><li>Create self-service and/or agent-assist AI agents in the Connect AI agent designer.</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-agents.html" target="_blank">documentation</a>.</li></ul>"""
-                      return html
-          
-                  # Build security profile map with their MCP applications
-                  sp_apps_map = {}
-                  try:
-                      sp_resp = connect_client.list_security_profiles(InstanceId=instance_id, MaxResults=100)
-                      for sp in sp_resp.get('SecurityProfileSummaryList', []):
-                          sp_id = sp['Id']
-                          sp_name = sp.get('Name', sp_id)
-                          apps = []
-                          try:
-                              app_resp = connect_client.list_security_profile_applications(
-                                  InstanceId=instance_id, SecurityProfileId=sp_id, MaxResults=100)
-                              apps = app_resp.get('Applications', [])
-                          except Exception:
-                              pass
-                          if apps:
-                              sp_apps_map[sp_id] = {'name': sp_name, 'apps': apps}
-                              logger.info(f"[O1] Security profile '{sp_name}' has {len(apps)} MCP app block(s)")
-                  except Exception as sp_err:
-                      logger.warning(f"[O1] Could not list security profiles: {sp_err}")
-          
-                  html += f"<br>Found {len(agents)} AI agent(s).<br><br>"
-                  html += """<table style="width: 100%"><tr><th>Agent Name</th><th>Type</th><th>Status</th><th>Tools</th><th>Security Profile</th></tr>"""
-                  for agent in agents:
-                      a_id = agent.get('aiAgentId', '')
-                      try:
-                          detail = qconnect_client.get_ai_agent(assistantId=assistant_id, aiAgentId=a_id)
-                          ai_agent = detail.get('aiAgent', {})
-                          name = escape(ai_agent.get('name', 'N/A'))
-                          a_type = escape(ai_agent.get('type', 'N/A'))
-                          status = escape(agent.get('status', 'N/A'))
-          
-                          # Extract tools from configuration
-                          config = ai_agent.get('configuration', {})
-                          logger.info(f"[O1] Agent '{name}' config keys: {list(config.keys())}")
-                          orch = config.get('orchestrationAIAgentConfiguration', {})
-                          logger.info(f"[O1] Agent '{name}' orch keys: {list(orch.keys())}")
-                          tools = orch.get('toolConfigurations', [])
-                          logger.info(f"[O1] Agent '{name}' has {len(tools)} tool(s) in toolConfigurations")
-          
-                          # Categorize tools
-                          mcp_tools = []
-                          builtin_tools = []
-                          for t in tools:
-                              t_type = t.get('toolType', 'UNKNOWN')
-                              t_name = t.get('toolName', t.get('title', 'unknown'))
-                              logger.debug(f"[O1]   Tool: type={t_type}, name={t_name}")
-                              if t_type == 'MODEL_CONTEXT_PROTOCOL':
-                                  mcp_tools.append(t_name)
-                              else:
-                                  builtin_tools.append(t_name)
-          
-                          # Build tools cell
-                          total_tools = len(mcp_tools) + len(builtin_tools)
-                          if total_tools > 0:
-                              parts = []
-                              if mcp_tools:
-                                  parts.append(f"{len(mcp_tools)} MCP")
-                              if builtin_tools:
-                                  parts.append(f"{len(builtin_tools)} built-in")
-                              tool_display = " + ".join(parts)
-                              tool_color = '#FF0000' if len(mcp_tools) > 30 else '#FFA500' if len(mcp_tools) > 15 else '#00FF00' if mcp_tools else '#CCCCCC'
-                              tool_cell = f'<span style="color:{tool_color}; font-weight:bold;">{tool_display}</span>'
-                              all_names = mcp_tools + builtin_tools
-                              tool_cell += f'<br><small>{", ".join(escape(n) for n in all_names[:6])}'
-                              if len(all_names) > 6:
-                                  tool_cell += f'... +{len(all_names)-6} more'
-                              tool_cell += '</small>'
-                          else:
-                              tool_cell = '<span style="color:#999;">None</span>'
-          
-                          # Find security profile - match by checking which profile has MCP apps
-                          # whose namespace matches tools in this agent
-                          sp_cell = '<span style="color:#999;">-</span>'
-                          agent_tool_ids = set()
-                          for t in tools:
-                              tid = t.get('toolId', '')
-                              if tid:
-                                  agent_tool_ids.add(tid)
-                                  # Also extract namespace from toolId like "gateway_NAMESPACE__TARGET___op"
-                                  if 'gateway_' in tid:
-                                      ns = tid.split('__')[0].replace('gateway_', '')
-                                      agent_tool_ids.add(ns)
-          
-                          if agent_tool_ids:
-                              for sp_id, sp_info in sp_apps_map.items():
-                                  matched = False
-                                  for app in sp_info['apps']:
-                                      ns = app.get('Namespace', '')
-                                      if ns and any(ns in tid for tid in agent_tool_ids):
-                                          matched = True
-                                          break
-                                  if matched:
-                                      sp_cell = escape(sp_info['name'])
-                                      logger.info(f"[O1] Agent '{name}' matched security profile '{sp_info['name']}'")
-                                      break
-          
-                          logger.info(f"[O1] Agent: {name}, mcp={len(mcp_tools)}, builtin={len(builtin_tools)}, sp={sp_cell}")
-                      except Exception as detail_err:
-                          logger.warning(f"[O1] Failed to get detail for agent {a_id}: {detail_err}")
-                          name = escape(agent.get('name', 'N/A'))
-                          a_type = 'N/A'
-                          status = escape(agent.get('status', 'N/A'))
-                          tool_cell = 'N/A'
-                          sp_cell = 'N/A'
-                      html += f"<tr><td>{name}</td><td>{a_type}</td><td>{status}</td><td>{tool_cell}</td><td>{sp_cell}</td></tr>"
-                  html += "</table>"
-                  return html
-              except Exception as e:
-                  logger.error(f"O1 Error: {e}")
-                  return html + f"<br>Error retrieving AI agent inventory: {escape(str(e))}"
-          
-          """O2: AI Prompt Configuration Review"""
-          def check_ai_prompt_configuration(assistant_id):
-              html = "<b>AI Prompt Configuration</b><br>"
-              logger.info(f"[O2] Starting AI Prompt Configuration check for assistant_id={assistant_id}")
-              try:
-                  prompts = paginate_api_call(qconnect_client.list_ai_prompts, 'aiPromptSummaries', assistantId=assistant_id, maxResults=100)
-                  logger.info(f"[O2] list_ai_prompts returned {len(prompts)} prompt(s)")
-                  if not prompts:
-                      html += "<br>No AI prompts configured."
-                      html += """<h4>Recommendation</h4><ul><li>Create AI prompts for self-service and agent-assist orchestration.</li></ul>"""
-                      return html
-          
-                  # Categorize models by size/latency profile
-                  LARGER_MODEL_PATTERNS = ['claude-3-opus', 'claude-sonnet-4', 'claude-3.5-sonnet', 'claude-3-sonnet']
-                  FASTER_MODEL_PATTERNS = ['claude-haiku', 'nova-lite', 'nova-micro', 'titan']
-          
-                  html += f"<br>Found {len(prompts)} AI prompt(s).<br>"
-                  html += """<p><em>Note: Connect AI Agents bill at a flat per-message/per-minute rate regardless of model.
-                      Model selection impacts response latency and quality, not cost.</em></p>"""
-                  html += """<table style="width: 90%"><tr><th>Prompt Name</th><th>Type</th><th>Model ID</th><th>Latency Profile</th></tr>"""
-                  larger_models = []
-                  model_summary = {}
-                  for p in prompts:
-                      p_id = p.get('aiPromptId', '')
-                      try:
-                          detail = qconnect_client.get_ai_prompt(assistantId=assistant_id, aiPromptId=p_id)
-                          prompt = detail.get('aiPrompt', {})
-                          name = escape(prompt.get('name', 'N/A'))
-                          p_type = escape(prompt.get('type', 'N/A'))
-                          model_id = escape(prompt.get('modelId', 'N/A'))
-                      except Exception:
-                          name = escape(p.get('name', 'N/A'))
-                          p_type = 'N/A'
-                          model_id = 'N/A'
-          
-                      # Determine latency profile
-                      if any(pat in model_id.lower() for pat in LARGER_MODEL_PATTERNS):
-                          latency_profile = 'Higher latency (larger model)'
-                          latency_color = '#FFA500'
-                          larger_models.append(name)
-                      elif any(pat in model_id.lower() for pat in FASTER_MODEL_PATTERNS):
-                          latency_profile = 'Lower latency (faster model)'
-                          latency_color = '#00FF00'
-                      else:
-                          latency_profile = 'Standard'
-                          latency_color = '#CCCCCC'
-          
-                      # Track model distribution
-                      short_model = model_id.split(':')[0] if ':' in model_id else model_id
-                      model_summary[short_model] = model_summary.get(short_model, 0) + 1
-          
-                      html += f'<tr><td>{name}</td><td>{p_type}</td><td>{model_id}</td><td style="background-color: {latency_color};">{latency_profile}</td></tr>'
-                  html += "</table>"
-          
-                  # Model distribution summary
-                  html += "<br><b>Model Distribution:</b><br>"
-                  html += """<table style="width: 50%"><tr><th>Model</th><th>Prompt Count</th></tr>"""
-                  for model, count in sorted(model_summary.items(), key=lambda x: x[1], reverse=True):
-                      html += f"<tr><td>{escape(model)}</td><td>{count}</td></tr>"
-                  html += "</table>"
-          
-                  if larger_models:
-                      html += f"""<h4>Performance Consideration</h4><ul>
-                          <li>{len(larger_models)} prompt(s) use larger models with higher latency. This is expected for agent-assist use cases requiring higher quality responses.</li>
-                          <li>For self-service (customer-facing) prompts where response speed matters, consider faster models like Claude Haiku or Nova Lite.</li>
-                          <li>Larger models increase the LLM inference time per turn, which compounds with MCP tool evaluation overhead (see S4 check).</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"O2 Error: {e}")
-                  return html + f"<br>Error retrieving AI prompt configuration: {escape(str(e))}"
-          
-          """S1: Q in Connect AI Guardrails"""
-          def check_q_guardrails(assistant_id):
-              html = "<b>Q in Connect AI Guardrails</b><br>"
-              logger.info(f"[S1] Starting Q Guardrails check for assistant_id={assistant_id}")
-              try:
-                  # --- Part 1: List and analyze guardrail configurations ---
-                  guardrails = paginate_api_call(qconnect_client.list_ai_guardrails, 'aiGuardrailSummaries', assistantId=assistant_id, maxResults=100)
-                  logger.info(f"[S1] list_ai_guardrails returned {len(guardrails)} guardrail(s)")
-                  published = [g for g in guardrails if g.get('visibilityStatus') == 'PUBLISHED']
-                  html += f"<br>Total guardrails: {len(guardrails)}, Published: {len(published)}<br>"
-          
-                  # Get detailed config for each guardrail to check filter coverage
-                  guardrail_details = []
-                  for g in guardrails:
-                      g_id = g.get('aiGuardrailId', '')
-                      detail = {}
-                      try:
-                          resp = qconnect_client.get_ai_guardrail(assistantId=assistant_id, aiGuardrailId=g_id)
-                          detail = resp.get('aiGuardrail', {})
-                          logger.info(f"[S1] Guardrail '{g.get('name')}' detail keys: {list(detail.keys())}")
-                      except Exception as gd_err:
-                          logger.warning(f"[S1] Could not get detail for guardrail {g_id}: {gd_err}")
-          
-                      # Check which filter types are configured
-                      has_content_filter = bool(detail.get('contentPolicyConfig', {}).get('filtersConfig', []))
-                      has_topic_policy = bool(detail.get('topicPolicyConfig', {}).get('topicsConfig', []))
-                      has_pii_filter = bool(detail.get('sensitiveInformationPolicyConfig', {}).get('piiEntitiesConfig', []) or
-                                            detail.get('sensitiveInformationPolicyConfig', {}).get('regexesConfig', []))
-                      has_word_filter = bool(detail.get('wordPolicyConfig', {}).get('wordsConfig', []) or
-                                            detail.get('wordPolicyConfig', {}).get('managedWordListsConfig', []))
-                      has_grounding = bool(detail.get('contextualGroundingPolicyConfig', {}).get('filtersConfig', []))
-          
-                      guardrail_details.append({
-                          'name': g.get('name', 'N/A'),
-                          'id': g_id,
-                          'status': g.get('status', 'N/A'),
-                          'visibility': g.get('visibilityStatus', 'N/A'),
-                          'content_filter': has_content_filter,
-                          'topic_policy': has_topic_policy,
-                          'pii_filter': has_pii_filter,
-                          'word_filter': has_word_filter,
-                          'grounding': has_grounding,
-                      })
-          
-                  # Render guardrail table with filter coverage
-                  if guardrail_details:
-                      html += """<br><table style="width: 90%"><tr><th>Guardrail Name</th><th>Status</th><th>Visibility</th>
-                          <th>Content Filter</th><th>Denied Topics</th><th>PII Filter</th><th>Word Filter</th><th>Contextual Grounding</th></tr>"""
-                      for gd in guardrail_details:
-                          yes = '<span style="color: green;">&#10003;</span>'
-                          no = '<span style="color: red;">&#10007;</span>'
-                          html += f"""<tr><td>{escape(gd['name'])}</td><td>{escape(gd['status'])}</td><td>{escape(gd['visibility'])}</td>
-                              <td style="text-align:center;">{yes if gd['content_filter'] else no}</td>
-                              <td style="text-align:center;">{yes if gd['topic_policy'] else no}</td>
-                              <td style="text-align:center;">{yes if gd['pii_filter'] else no}</td>
-                              <td style="text-align:center;">{yes if gd['word_filter'] else no}</td>
-                              <td style="text-align:center;">{yes if gd['grounding'] else no}</td></tr>"""
-                      html += "</table>"
-          
-                      # Check for missing critical filters
-                      missing_checks = []
-                      for gd in guardrail_details:
-                          if gd['visibility'] == 'PUBLISHED':
-                              if not gd['content_filter']:
-                                  missing_checks.append(f"'{gd['name']}' is missing <strong>Content Filter</strong> (hate, insult, sexual, violence)")
-                              if not gd['pii_filter']:
-                                  missing_checks.append(f"'{gd['name']}' is missing <strong>PII Filter</strong> (credit cards, SSNs, emails)")
-                              if not gd['topic_policy']:
-                                  missing_checks.append(f"'{gd['name']}' is missing <strong>Denied Topics</strong> (off-topic, competitor mentions)")
-                              if not gd['grounding']:
-                                  missing_checks.append(f"'{gd['name']}' is missing <strong>Contextual Grounding</strong> (hallucination prevention)")
-                      if missing_checks:
-                          html += '<br><span style="color: #FFA500; font-weight: bold;">Missing critical guardrail filters detected:</span><ul>'
-                          for mc in missing_checks:
-                              html += f"<li>{mc}</li>"
-                          html += "</ul>"
-          
-                  # --- Part 2: Check which AI agents have guardrails associated ---
-                  # Check BOTH $LATEST (draft/SAVED) and PUBLISHED versions of each agent.
-                  html += "<br><b>AI Agent Guardrail Association</b><br>"
-                  agents = paginate_api_call(qconnect_client.list_ai_agents, 'aiAgentSummaries', assistantId=assistant_id, maxResults=100)
-                  agents_with_guardrail_published = []
-                  agents_with_guardrail_draft_only = []
-                  agents_without_guardrail = []
-          
-                  for agent in agents:
-                      a_id = agent.get('aiAgentId', '')
-                      a_name = agent.get('name', 'N/A')
-                      a_visibility = agent.get('visibilityStatus', '')
-          
-                      def extract_guardrail_id(agent_data):
-                          config = agent_data.get('configuration', {})
-                          orch = config.get('orchestrationAIAgentConfiguration', {})
-                          # Primary key: orchestrationAIGuardrailId (the actual field name)
-                          g_id = orch.get('orchestrationAIGuardrailId', '')
-                          if not g_id:
-                              g_id = orch.get('guardrailId', '')
-                          if not g_id:
-                              ss = config.get('selfServiceAIAgentConfiguration', {})
-                              g_id = ss.get('orchestrationAIGuardrailId', '') or ss.get('guardrailId', '')
-                          # Strip version suffix (e.g., "uuid:1" -> "uuid") for display
-                          return g_id
-          
-                      try:
-                          # Get the agent detail ($LATEST)
-                          latest_resp = qconnect_client.get_ai_agent(assistantId=assistant_id, aiAgentId=a_id)
-                          latest_agent = latest_resp.get('aiAgent', {})
-                          latest_guardrail = extract_guardrail_id(latest_agent)
-                          latest_visibility = latest_agent.get('visibilityStatus', '')
-                          logger.info(f"[S1] Agent '{a_name}': guardrail='{latest_guardrail}', "
-                                     f"agent_visibility={a_visibility}, latest_visibility={latest_visibility}")
-          
-                          # Determine if the guardrail is in the PUBLISHED version:
-                          # If the agent's visibilityStatus from list_ai_agents is PUBLISHED,
-                          # then $LATEST IS the published version.
-                          if latest_guardrail and a_visibility == 'PUBLISHED':
-                              agents_with_guardrail_published.append({
-                                  'name': a_name, 'guardrail_id': latest_guardrail, 'status': 'PUBLISHED'})
-                              logger.info(f"[S1] Agent '{a_name}': guardrail PUBLISHED ✓")
-                          elif latest_guardrail:
-                              agents_with_guardrail_draft_only.append({
-                                  'name': a_name, 'guardrail_id': latest_guardrail, 'status': 'DRAFT ONLY'})
-                              logger.info(f"[S1] Agent '{a_name}': guardrail DRAFT ONLY")
-                          else:
-                              agents_without_guardrail.append(a_name)
-                              logger.info(f"[S1] Agent '{a_name}': NO guardrail")
-                      except Exception as agent_err:
-                          logger.warning(f"[S1] Error checking agent {a_name}: {agent_err}")
-                          agents_without_guardrail.append(a_name)
-          
-                  total_agents = len(agents)
-                  pub_protected = len(agents_with_guardrail_published)
-                  draft_only = len(agents_with_guardrail_draft_only)
-                  unprotected = len(agents_without_guardrail)
-                  html += f"<br>Total AI agents: {total_agents} | Guardrail published: {pub_protected} | Guardrail draft-only: {draft_only} | No guardrail: {unprotected}<br>"
-          
-                  if agents_with_guardrail_published or agents_with_guardrail_draft_only:
-                      html += """<br><table style="width: 70%"><tr><th>AI Agent</th><th>Guardrail ID</th><th>Status</th></tr>"""
-                      for a in agents_with_guardrail_published:
-                          html += f'<tr><td>{escape(a["name"])}</td><td>{escape(a["guardrail_id"])}</td><td style="background-color: #00FF00;">PUBLISHED</td></tr>'
-                      for a in agents_with_guardrail_draft_only:
-                          html += f'<tr><td>{escape(a["name"])}</td><td>{escape(a["guardrail_id"])}</td><td style="background-color: #FFA500;">DRAFT ONLY (not live)</td></tr>'
-                      html += "</table>"
-                  if draft_only > 0:
-                      html += f'<br><span style="color: #FFA500; font-weight: bold;">{draft_only} agent(s) have guardrails in draft/SAVED state only - publish the agent to activate guardrail protection.</span><br>'
-                  if agents_without_guardrail:
-                      html += '<br><span style="color: #FFA500;">AI agents without any guardrail:</span><ul>'
-                      for a_name in agents_without_guardrail:
-                          html += f"<li>{escape(a_name)}</li>"
-                      html += "</ul>"
-          
-                  # --- Final recommendations ---
-                  if not published:
-                      html += """<br><span style="color: red; font-weight: bold;">CRITICAL: No published AI guardrails found. PII protection and content filtering are NOT active.</span>"""
-                  if not published or missing_checks or agents_without_guardrail or agents_with_guardrail_draft_only:
-                      html += """<h4>Recommendation</h4><ul>"""
-                      if not published:
-                          html += "<li>Deploy at least one guardrail with all five filter types enabled.</li>"
-                      if missing_checks:
-                          html += "<li>Add missing filter types to existing guardrails (see table above).</li>"
-                      if agents_with_guardrail_draft_only:
-                          html += f"<li>{draft_only} AI agent(s) have guardrails in draft/SAVED state only - publish the agent version to activate protection.</li>"
-                      if agents_without_guardrail:
-                          html += f"<li>{unprotected} AI agent(s) have no guardrail at all - configure guardrails in the AI agent's orchestration settings.</li>"
-                      html += """<li>Recommended filter coverage: Content Filter + PII Filter + Denied Topics + Word Filter + Contextual Grounding.</li>
-                          <li>Maximum 3 custom guardrails per assistant.</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/ai-guardrails.html" target="_blank">documentation</a>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"S1 Error: {e}")
-                  return html + f"<br>Error checking guardrails: {escape(str(e))}"
-          
-          """S4: Q in Connect Domain Encryption"""
-          def check_q_domain_encryption(assistant_id):
-              html = "<b>Q in Connect Domain Encryption</b><br>"
-              logger.info(f"[S4] Starting Domain Encryption check for assistant_id={assistant_id}")
-              try:
-                  response = qconnect_client.get_assistant(assistantId=assistant_id)
-                  assistant = response.get('assistant', {})
-                  logger.info(f"[S4] get_assistant returned: name={assistant.get('name', 'N/A')}, status={assistant.get('status', 'N/A')}, type={assistant.get('type', 'N/A')}")
-                  enc_config = assistant.get('serverSideEncryptionConfiguration', {})
-                  kms_key = enc_config.get('kmsKeyId', '')
-                  if kms_key:
-                      masked_key = kms_key[:40] + '...' if len(kms_key) > 40 else kms_key
-                      html += f"<br>Customer-managed KMS key configured: <code>{escape(masked_key)}</code>"
-                  else:
-                      html += "<br>Using AWS-owned encryption key (no customer-managed KMS key)."
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Configure a customer-managed KMS key for the Q in Connect domain to enable key rotation auditing and access control.</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/encryption-at-rest.html" target="_blank">documentation</a>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"S4 Error: {e}")
-                  return html + f"<br>Error checking domain encryption: {escape(str(e))}"
-          
-          """P1: AI Agent Logging & Observability"""
-          def check_ai_agent_logging(assistant_id, account_id, aws_region):
-              html = "<b>AI Agent Logging &amp; Observability</b><br>"
-              logger.info(f"[P1] Starting AI Agent Logging check for assistant_id={assistant_id}, account={account_id}, region={aws_region}")
-              try:
-                  assistant_arn = f"arn:aws:wisdom:{aws_region}:{account_id}:assistant/{assistant_id}"
-                  logger.info(f"[P1] Constructed assistant ARN: {assistant_arn}")
-                  response = logs_client.describe_deliveries()
-                  deliveries = response.get('deliveries', [])
-                  logger.info(f"[P1] describe_deliveries returned {len(deliveries)} total delivery/deliveries")
-                  for d in deliveries:
-                      logger.debug(f"[P1] Delivery: id={d.get('id')}, source={d.get('deliverySourceName')}, dest_type={d.get('deliveryDestinationType')}")
-                  # Match by checking if assistant_id appears in source name OR by checking delivery source ARNs
-                  matching = []
-                  for d in deliveries:
-                      source_name = d.get('deliverySourceName', '')
-                      # Check direct assistant_id match in source name
-                      if assistant_id in source_name:
-                          matching.append(d)
-                      # Also check for wisdom/qconnect delivery sources (WdDeliverySource pattern)
-                      elif 'WdDeliverySource' in source_name or 'wisdom' in source_name.lower() or 'qconnect' in source_name.lower():
-                          # This could be the assistant's delivery - check the delivery source details
-                          try:
-                              source_detail = logs_client.describe_delivery_sources()
-                              for src in source_detail.get('deliverySources', []):
-                                  if src.get('name') == source_name and assistant_id in src.get('resourceArn', ''):
-                                      matching.append(d)
-                                      logger.info(f"[P1] Matched delivery via source ARN: {src.get('resourceArn')}")
-                                      break
-                          except Exception as src_err:
-                              logger.debug(f"[P1] Could not check delivery source detail: {src_err}")
-                  logger.info(f"[P1] Found {len(matching)} delivery/deliveries matching assistant_id={assistant_id}")
-                  if matching:
-                      html += f"<br>CloudWatch log delivery configured ({len(matching)} delivery/deliveries found).<br>"
-                      html += """<table style="width: 80%"><tr><th>Delivery ID</th><th>Source</th><th>Destination Type</th></tr>"""
-                      for d in matching:
-                          html += f"<tr><td>{escape(d.get('id', 'N/A'))}</td><td>{escape(d.get('deliverySourceName', 'N/A'))}</td><td>{escape(d.get('deliveryDestinationType', 'N/A'))}</td></tr>"
-                      html += "</table>"
-                  else:
-                      html += """<br><span style="color: #FFA500; font-weight: bold;">No CloudWatch Vended Logs delivery configured for AI Agent event logs.</span>"""
-                      html += """<p><em>Note: This checks for AI Agent-specific event log delivery (TRANSCRIPT_AGENTIC_MESSAGE, TRANSCRIPT_SELF_SERVICE_MESSAGE, etc.),
-                          not standard Connect contact flow logging which may be enabled separately at the instance level.</em></p>"""
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Enable AI Agent event logging via CloudWatch Vended Logs delivery for the assistant ARN.</li>
-                          <li>This provides granular AI agent observability: tool invocation traces, LLM token usage, session analytics, intent detection, and recommendation tracking.</li>
-                          <li>Standard contact flow logging (if enabled) does not capture these AI agent-specific events.</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/monitor-ai-agents.html" target="_blank">documentation</a>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"P1 Error: {e}")
-                  return html + f"<br>Error checking AI agent logging: {escape(str(e))}"
-          
-          """Q2: Q in Connect Hard Limits"""
-          def check_q_hard_limits(assistant_id):
-              html = "<b>Q in Connect Service Limits</b><br>"
-              logger.info(f"[Q2] Starting Q Hard Limits check for assistant_id={assistant_id}")
-              try:
-                  assistants = paginate_api_call(qconnect_client.list_assistants, 'assistantSummaries', maxResults=100)
-                  total_assistants = len(assistants)
-                  logger.info(f"[Q2] list_assistants returned {total_assistants} assistant(s)")
-                  for a in assistants:
-                      logger.info(f"[Q2] Assistant: id={a.get('assistantId')}, name={a.get('name')}, type={a.get('type')}, status={a.get('status')}")
-          
-                  kb_associations = []
-                  try:
-                      assoc_resp = qconnect_client.list_assistant_associations(assistantId=assistant_id, maxResults=100)
-                      kb_associations = [a for a in assoc_resp.get('assistantAssociationSummaries', []) if a.get('associationType') == 'KNOWLEDGE_BASE']
-                  except Exception as e:
-                      logger.warning(f"Could not list assistant associations: {e}")
-          
-                  html += """<br><table style="width: 50%">
-                      <tr><th>Resource</th><th>Current</th><th>Limit</th><th>Usage %</th></tr>"""
-                  # Assistants per account (limit 5, not adjustable)
-                  asst_pct = round(total_assistants / 5 * 100, 1)
-                  html += f'<tr><td>Assistants per account</td><td>{total_assistants}</td><td>5</td><td style="background-color: {get_color_by_percentage(asst_pct)};">{asst_pct}%</td></tr>'
-                  # KBs per assistant (limit 10)
-                  kb_count = len(kb_associations)
-                  kb_pct = round(kb_count / 10 * 100, 1)
-                  html += f'<tr><td>Knowledge Bases per assistant</td><td>{kb_count}</td><td>10</td><td style="background-color: {get_color_by_percentage(kb_pct)};">{kb_pct}%</td></tr>'
-                  # Assistant associations per instance (limit 1, not adjustable)
-                  html += f'<tr><td>Assistant per Connect instance</td><td>1</td><td>1</td><td style="background-color: {get_color_by_percentage(100)};">100%</td></tr>'
-                  html += "</table>"
-          
-                  # Check article counts per KB
-                  if kb_associations:
-                      html += "<br><b>Knowledge Base Article Counts</b><br>"
-                      html += """<table style="width: 60%"><tr><th>Knowledge Base ID</th><th>Articles</th><th>Limit</th><th>Usage %</th></tr>"""
-                      for assoc in kb_associations:
-                          kb_id = assoc.get('associationData', {}).get('knowledgeBaseAssociation', {}).get('knowledgeBaseId', '')
-                          if kb_id:
-                              try:
-                                  contents = paginate_api_call(qconnect_client.list_contents, 'contentSummaries', knowledgeBaseId=kb_id, maxResults=100)
-                                  article_count = len(contents)
-                                  art_pct = round(article_count / 5000 * 100, 1)
-                                  html += f'<tr><td>{escape(kb_id)}</td><td>{article_count}</td><td>5000</td><td style="background-color: {get_color_by_percentage(art_pct)};">{art_pct}%</td></tr>'
-                              except Exception:
-                                  html += f'<tr><td>{escape(kb_id)}</td><td>N/A</td><td>5000</td><td>N/A</td></tr>'
-                      html += "</table>"
-          
-                  html += """<h4>Key Constraints</h4><ul>
-                      <li>1 assistant association per Connect instance (not adjustable) - plan architecture accordingly.</li>
-                      <li>5,000 articles per knowledge base (not adjustable) - prioritize by relevance, retire stale content.</li>
-                      <li>5 GB maximum knowledge base size (not adjustable).</li>
-                      <li>SendMessage API: 1-2 TPS depending on region.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"Q2 Error: {e}")
-                  return html + f"<br>Error checking Q in Connect limits: {escape(str(e))}"
-          
-          """R3: Knowledge Base Association & Sync Health"""
-          def check_kb_sync_health(assistant_id):
-              html = "<b>Knowledge Base Sync Health</b><br>"
-              logger.info(f"[R1] Starting KB Sync Health check for assistant_id={assistant_id}")
-              try:
-                  assoc_resp = qconnect_client.list_assistant_associations(assistantId=assistant_id, maxResults=100)
-                  all_associations = assoc_resp.get('assistantAssociationSummaries', [])
-                  logger.info(f"[R1] list_assistant_associations returned {len(all_associations)} total association(s)")
-                  for a in all_associations:
-                      logger.info(f"[R1] Association: type={a.get('associationType')}, id={a.get('assistantAssociationId')}")
-                  kb_associations = [a for a in all_associations if a.get('associationType') == 'KNOWLEDGE_BASE']
-                  logger.info(f"[R1] Found {len(kb_associations)} KNOWLEDGE_BASE association(s)")
-          
-                  if not kb_associations:
-                      html += "<br>No knowledge bases associated with this assistant."
-                      html += """<h4>Recommendation</h4><ul><li>Associate at least one knowledge base with the assistant for AI agent retrieval capabilities.</li></ul>"""
-                      return html
-          
-                  html += f"<br>Found {len(kb_associations)} knowledge base association(s).<br><br>"
-                  html += """<table style="width: 90%"><tr><th>KB Name</th><th>KB ID</th><th>Status</th><th>Last Content Modified</th><th>Time Since Last Update</th><th>Freshness</th></tr>"""
-                  review_kbs = []
-                  for assoc in kb_associations:
-                      kb_id = assoc.get('associationData', {}).get('knowledgeBaseAssociation', {}).get('knowledgeBaseId', '')
-                      if not kb_id:
-                          continue
-                      try:
-                          kb_resp = qconnect_client.get_knowledge_base(knowledgeBaseId=kb_id)
-                          kb = kb_resp.get('knowledgeBase', {})
-                          kb_name = escape(kb.get('name', 'N/A'))
-                          kb_status = escape(kb.get('status', 'N/A'))
-                          last_modified = kb.get('lastContentModificationTime')
-                          if last_modified:
-                              hours_since = (datetime.now(timezone.utc) - last_modified).total_seconds() / 3600
-                              days_since = hours_since / 24
-                              if days_since >= 1:
-                                  time_str = f"{days_since:.1f} days"
-                              else:
-                                  time_str = f"{hours_since:.1f} hours"
-                              # Freshness is informational, not a hard pass/fail
-                              if hours_since <= 24:
-                                  freshness = "Recent"
-                                  color = "#00FF00"
-                              elif hours_since <= 168:
-                                  freshness = "Review"
-                                  color = "#FFA500"
-                                  review_kbs.append(kb_name)
-                              else:
-                                  freshness = "Review"
-                                  color = "#FFA500"
-                                  review_kbs.append(kb_name)
-                              last_mod_str = last_modified.strftime("%Y-%m-%d %H:%M UTC")
-                          else:
-                              time_str = "Unknown"
-                              freshness = "Unknown"
-                              color = "#FFA500"
-                              last_mod_str = "Never"
-                              review_kbs.append(kb_name)
-                          html += f'<tr><td>{kb_name}</td><td>{escape(kb_id)}</td><td>{kb_status}</td><td>{last_mod_str}</td><td>{time_str}</td><td style="background-color: {color};">{freshness}</td></tr>'
-                      except Exception as kb_err:
-                          html += f'<tr><td>N/A</td><td>{escape(kb_id)}</td><td>ERROR</td><td>N/A</td><td>N/A</td><td style="background-color: #FFA500;">ERROR</td></tr>'
-                          logger.warning(f"Error getting KB {kb_id}: {kb_err}")
-                  html += "</table>"
-                  html += """<p><em>Note: The required sync frequency depends on how often your source content changes.
-                      Verify that the last content modification time aligns with your expected update schedule.
-                      If source content has changed but the knowledge base has not been updated, check your sync configuration.</em></p>"""
-                  if review_kbs:
-                      html += f"""<h4>Recommendation</h4><ul>
-                          <li>Knowledge base(s) to review: {', '.join(review_kbs)}. Verify content is up to date with your source.</li>
-                          <li>Default sync interval is 1 hour. Options: every 1 hour, every 3 hours, or daily. For S3 sources, sync is triggered by S3 object events.</li>
-                          <li>Consider setting a CloudWatch alarm on <code>RecordsFailed &gt; 0</code> in <code>AWS/AppIntegrations</code> namespace to detect sync failures.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"R1 Error: {e}")
-                  return html + f"<br>Error checking KB sync health: {escape(str(e))}"
-          
-          """P8: Connect Contact Flow Errors"""
-          def check_flow_errors(instance_id, days_back):
-              html = "<b>Contact Flow Errors &amp; Fatal Errors</b><br>"
-              try:
-                  end_time = datetime.utcnow()
-                  start_time = end_time - timedelta(days=days_back)
-                  # Check ContactFlowFatalErrors
-                  fatal_resp = cloudwatch_client.get_metric_statistics(
-                      Namespace='AWS/Connect', MetricName='ContactFlowFatalErrors',
-                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                      StartTime=start_time, EndTime=end_time, Period=86400, Statistics=['Sum'])
-                  fatal_dps = fatal_resp.get('Datapoints', [])
-                  total_fatal = int(sum(d.get('Sum', 0) for d in fatal_dps))
-          
-                  # Check ContactFlowErrors
-                  error_resp = cloudwatch_client.get_metric_statistics(
-                      Namespace='AWS/Connect', MetricName='ContactFlowErrors',
-                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                      StartTime=start_time, EndTime=end_time, Period=86400, Statistics=['Sum'])
-                  error_dps = error_resp.get('Datapoints', [])
-                  total_errors = int(sum(d.get('Sum', 0) for d in error_dps))
-          
-                  fatal_color = "#FF0000" if total_fatal > 0 else "#00FF00"
-                  error_color = "#FF0000" if total_errors > 50 else "#FFA500" if total_errors > 0 else "#00FF00"
-          
-                  html += f"""<br><table style="width: 50%">
-                      <tr><th>Metric</th><th>Count ({days_back} days)</th><th>Status</th></tr>
-                      <tr><td>Contact Flow Fatal Errors</td><td>{total_fatal}</td><td style="background-color: {fatal_color};">{'CRITICAL' if total_fatal > 0 else 'OK'}</td></tr>
-                      <tr><td>Contact Flow Errors</td><td>{total_errors}</td><td style="background-color: {error_color};">{'CRITICAL' if total_errors > 50 else 'WARNING' if total_errors > 0 else 'OK'}</td></tr>
-                      </table>"""
-                  if total_fatal > 0 or total_errors > 50:
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Fatal errors indicate flow execution failures - check Lambda timeouts, Bedrock throttling, and missing error branches.</li>
-                          <li>Correlate with Bedrock latency (P6) and throttling (P7) findings for root cause.</li>
-                          <li>Set CloudWatch alarm: <code>ContactFlowFatalErrors &gt; 0</code> for any 5-minute window.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"P8 Error: {e}")
-                  return html + f"<br>Error checking flow errors: {escape(str(e))}"
-          
-          """S3: KMS Encryption for Connect Storage"""
-          def check_connect_storage_encryption(instance_id):
-              html = "<b>KMS Encryption for Connect Storage</b><br>"
-              logger.info(f"[S3] Starting Connect Storage Encryption check for instance_id={instance_id}")
-              try:
-                  resource_types = ['CALL_RECORDINGS', 'CHAT_TRANSCRIPTS', 'SCHEDULED_REPORTS', 'MEDIA_STREAMS', 'AGENT_EVENTS']
-                  html += """<br><table style="width: 70%"><tr><th>Storage Type</th><th>Encryption Type</th><th>KMS Key</th><th>Status</th></tr>"""
-                  has_issues = False
-                  for res_type in resource_types:
-                      try:
-                          resp = connect_client.list_instance_storage_configs(
-                              InstanceId=instance_id,
-                              ResourceType=res_type
-                          )
-                          configs = resp.get('StorageConfigs', [])
-                          if not configs:
-                              html += f'<tr><td>{escape(res_type)}</td><td>Not configured</td><td>N/A</td><td style="background-color: #CCCCCC;">N/A</td></tr>'
-                              continue
-                          for config in configs:
-                              enc = config.get('KinesisVideoStreamConfig', {}).get('EncryptionConfig', {}) or \
-                                    config.get('S3Config', {}).get('EncryptionConfig', {}) or \
-                                    config.get('KinesisStreamConfig', {}).get('EncryptionConfig', {}) or \
-                                    config.get('KinesisFirehoseConfig', {}).get('EncryptionConfig', {}) or {}
-                              enc_type = enc.get('EncryptionType', 'Not set')
-                              key_id = enc.get('KeyId', 'N/A')
-                              if enc_type == 'KMS' and key_id and not key_id.startswith('alias/aws/'):
-                                  status = 'CMK'
-                                  color = '#00FF00'
-                              elif enc_type == 'KMS':
-                                  status = 'AWS Managed'
-                                  color = '#FFA500'
-                                  has_issues = True
-                              else:
-                                  status = 'No KMS'
-                                  color = '#FFA500'
-                                  has_issues = True
-                              masked_key = (key_id[:40] + '...') if len(key_id) > 40 else key_id
-                              html += f'<tr><td>{escape(res_type)}</td><td>{escape(enc_type)}</td><td>{escape(masked_key)}</td><td style="background-color: {color};">{status}</td></tr>'
-                      except ClientError as e:
-                          if e.response['Error']['Code'] == 'ResourceNotFoundException':
-                              html += f'<tr><td>{escape(res_type)}</td><td>Not configured</td><td>N/A</td><td style="background-color: #CCCCCC;">N/A</td></tr>'
-                          else:
-                              html += f'<tr><td>{escape(res_type)}</td><td colspan="3">Error: {escape(e.response["Error"]["Code"])}</td></tr>'
-                  html += "</table>"
-                  if has_issues:
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Use customer-managed KMS keys for all storage types for full control over key rotation and access auditing.</li>
-                          <li>Refer <a href="https://docs.aws.amazon.com/connect/latest/adminguide/encryption-at-rest.html" target="_blank">documentation</a>.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"S3 Error: {e}")
-                  return html + f"<br>Error checking storage encryption: {escape(str(e))}"
-          
-          """Q2: Lambda Integration Limits"""
-          def check_lambda_integration_limits(instance_id):
-              html = "<b>Lambda Integration Limits</b><br>"
-              logger.info(f"[Q2] Starting Lambda Integration Limits check for instance_id={instance_id}")
-              try:
-                  lambda_functions = []
-                  next_token = None
-                  while True:
-                      kwargs = {'InstanceId': instance_id, 'MaxResults': 25}
-                      if next_token:
-                          kwargs['NextToken'] = next_token
-                      resp = connect_client.list_lambda_functions(**kwargs)
-                      lambda_functions.extend(resp.get('LambdaFunctions', []))
-                      next_token = resp.get('NextToken')
-                      if not next_token:
-                          break
-                  total = len(lambda_functions)
-                  logger.info(f"[Q2] Found {total} Lambda function(s)")
-                  limit = 50
-                  pct = round(total / limit * 100, 1)
-                  color = get_color_by_percentage(pct)
-                  html += f"""<br><table style="width: 50%">
-                      <tr><th>Resource</th><th>Current</th><th>Limit</th><th>Usage %</th></tr>
-                      <tr><td>Lambda functions per instance</td><td>{total}</td><td>{limit}</td><td style="background-color: {color};">{pct}%</td></tr>
-                      </table>"""
-                  if lambda_functions:
-                      html += "<br><b>Associated Lambda Functions:</b><br>"
-                      html += """<table style="width: 80%"><tr><th>#</th><th>Lambda Function ARN</th></tr>"""
-                      for i, fn_arn in enumerate(lambda_functions, 1):
-                          html += f"<tr><td>{i}</td><td>{escape(fn_arn)}</td></tr>"
-                      html += "</table>"
-                  if pct >= 80:
-                      html += """<h4>Recommendation</h4><ul>
-                          <li>Lambda function count is approaching the 50-function limit (adjustable).</li>
-                          <li>Consolidate Lambda functions using a router pattern (single function dispatching to different handlers).</li>
-                          <li>Request quota increase if needed.</li></ul>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"Q2 Error: {e}")
-                  return html + f"<br>Error checking Lambda limits: {escape(str(e))}"
-          
-          """S4: MCP Tool Sprawl Detection"""
-          def check_mcp_tool_sprawl(instance_id):
-              html = "<b>MCP Tool Sprawl &amp; Unused Tool Detection</b><br>"
-              logger.info(f"[SEC-MCP] Starting MCP Tool Sprawl check for instance_id={instance_id}")
-              html += """<div style="background-color: #e8f4f8; padding: 10px; margin: 10px 0; border-left: 4px solid #0073bb;">
-                  <p><strong>Why This Check Matters:</strong> When an AI agent has many MCP tools available, the LLM must evaluate
-                  ALL tools during each inference cycle to determine which to invoke. A larger tool space directly increases
-                  the tool-selection phase of each inference, causing measurable response latency.</p></div>"""
-              try:
-                  profiles_resp = connect_client.list_security_profiles(InstanceId=instance_id, MaxResults=100)
-                  security_profiles = profiles_resp.get('SecurityProfileSummaryList', [])
-                  logger.info(f"[SEC-MCP] list_security_profiles returned {len(security_profiles)} profile(s)")
-          
-                  profile_analysis = []
-                  has_critical = False
-                  total_mcp_tools = 0
-          
-                  for profile_summary in security_profiles:
-                      profile_id = profile_summary['Id']
-                      profile_name = profile_summary.get('Name', 'Unknown')
-                      logger.info(f"[SEC-MCP] Checking profile: {profile_name} (id={profile_id})")
-                      try:
-                          detail = connect_client.describe_security_profile(
-                              InstanceId=instance_id,
-                              SecurityProfileId=profile_id
-                          )
-                          security_profile = detail.get('SecurityProfile', {})
-                          applications = security_profile.get('Applications', [])
-                          logger.info(f"[SEC-MCP] Profile '{profile_name}': {len(applications)} application block(s) from describe_security_profile")
-          
-                          # If Applications is empty, try list_security_profile_applications API
-                          if not applications:
-                              try:
-                                  app_resp = connect_client.list_security_profile_applications(
-                                      InstanceId=instance_id,
-                                      SecurityProfileId=profile_id,
-                                      MaxResults=100
-                                  )
-                                  app_list = app_resp.get('Applications', [])
-                                  if app_list:
-                                      applications = app_list
-                                      logger.info(f"[SEC-MCP] Profile '{profile_name}': {len(applications)} application(s) from list_security_profile_applications")
-                                  else:
-                                      logger.debug(f"[SEC-MCP] Profile '{profile_name}': list_security_profile_applications also returned 0")
-                              except Exception as app_err:
-                                  logger.debug(f"[SEC-MCP] list_security_profile_applications not available or failed for '{profile_name}': {app_err}")
-          
-                          logger.info(f"[SEC-MCP] Profile '{profile_name}': final {len(applications)} application(s), "
-                                     f"AllowedAccessControlTags={security_profile.get('AllowedAccessControlTags', {})}")
-          
-                          mcp_tools = []
-                          api_targets = {}
-                          for app in applications:
-                              namespace = app.get('Namespace', 'Unknown')
-                              permissions = app.get('ApplicationPermissions', [])
-                              for permission in permissions:
-                                  parts = permission.split('___')
-                                  target = parts[0] if len(parts) > 1 else 'Unknown'
-                                  operation = parts[1] if len(parts) > 1 else permission
-                                  mcp_tools.append({'namespace': namespace, 'tool_name': permission, 'api_target': target, 'operation': operation})
-                                  if target not in api_targets:
-                                      api_targets[target] = []
-                                  api_targets[target].append(operation)
-          
-                          tool_count = len(mcp_tools)
-                          total_mcp_tools += tool_count
-          
-                          if tool_count > 30:
-                              status = 'FAIL'
-                              has_critical = True
-                              severity = 'CRITICAL'
-                              color = '#FF0000'
-                          elif tool_count > 15:
-                              status = 'WARNING'
-                              severity = 'HIGH'
-                              color = '#FFA500'
-                          elif tool_count > 0:
-                              status = 'PASS'
-                              severity = 'OK'
-                              color = '#00FF00'
-                          else:
-                              status = 'INFO'
-                              severity = 'N/A'
-                              color = '#CCCCCC'
-          
-                          profile_analysis.append({
-                              'name': profile_name, 'id': profile_id,
-                              'tool_count': tool_count, 'target_count': len(api_targets),
-                              'api_targets': api_targets, 'status': status,
-                              'severity': severity, 'color': color
-                          })
-                      except ClientError as e:
-                          logger.warning(f"Could not describe security profile {profile_id}: {e}")
-          
-                  profiles_with_mcp = [p for p in profile_analysis if p['tool_count'] > 0]
-                  critical_profiles = [p for p in profile_analysis if p['status'] == 'FAIL']
-          
-                  html += f"<br><strong>Summary:</strong> {len(security_profiles)} profiles scanned | "
-                  html += f"{len(profiles_with_mcp)} with MCP tools | "
-                  html += f"{len(critical_profiles)} critical | "
-                  html += f"{total_mcp_tools} total MCP tools<br><br>"
-          
-                  if profiles_with_mcp:
-                      html += """<table style="width: 80%"><tr><th>Security Profile</th><th>MCP Tools</th><th>API Targets</th><th>Status</th></tr>"""
-                      for p in sorted(profile_analysis, key=lambda x: x['tool_count'], reverse=True):
-                          if p['tool_count'] > 0:
-                              html += f'<tr><td><strong>{escape(p["name"])}</strong></td>'
-                              html += f'<td style="text-align:center;"><strong>{p["tool_count"]}</strong></td>'
-                              html += f'<td style="text-align:center;">{p["target_count"]}</td>'
-                              html += f'<td style="background-color: {p["color"]}; text-align:center;">{p["severity"]}</td></tr>'
-                      html += "</table>"
-          
-                      # Show API target breakdown for critical profiles
-                      for p in critical_profiles:
-                          html += f"<br><strong>Profile: {escape(p['name'])} - {p['tool_count']} tools across {p['target_count']} API targets:</strong><br>"
-                          html += """<table style="width: 60%"><tr><th>API Target</th><th>Operations</th></tr>"""
-                          for target, ops in p['api_targets'].items():
-                              html += f"<tr><td>{escape(target)}</td><td>{len(ops)} ({', '.join(escape(o) for o in ops[:5])}{'...' if len(ops) > 5 else ''})</td></tr>"
-                          html += "</table>"
-                  else:
-                      html += "<br>No MCP tools configured on any security profile."
-          
-                  if has_critical:
-                      html += """<div style="background-color: #ffebee; padding: 10px; margin: 10px 0; border-left: 4px solid #d32f2f;">
-                          <h4>Immediate Action Required</h4><ol>
-                          <li><strong>Audit usage:</strong> Check CloudWatch Logs for which MCP tools are actually invoked by AI agents.</li>
-                          <li><strong>Remove unused:</strong> Remove permissions not used by the AI agent's specific use case.</li>
-                          <li><strong>Role-specific profiles:</strong> Create separate security profiles per AI agent instead of one with all tools.</li>
-                          <li><strong>Test latency:</strong> Verify improvement after reduction.</li></ol></div>"""
-                  return html
-              except Exception as e:
-                  logger.error(f"SEC-MCP Error: {e}")
-                  return html + f"<br>Error checking MCP tool sprawl: {escape(str(e))}"
-          
-
-          """AI Agent Performance Metrics (via GetMetricDataV2)"""
-          def check_ai_agent_performance_metrics(instance_id, instance_arn, days_back=7):
-              html = "<b>AI Agent Performance Metrics</b><br>"
-              logger.info(f"[AI-PERF] Starting AI Agent Performance Metrics check")
-              try:
-                  parsed = parse_connect_instance_arn(instance_arn)
-                  region = parsed['aws_region']
-                  regional_client = boto3.client('connect', region_name=region)
-
-                  end_time = datetime.now(timezone.utc)
-                  start_time = end_time - timedelta(days=days_back)
-
-                  AI_METRICS = [
-                      {'Name': 'GOAL_SUCCESS_RATE', 'label': 'Goal Success Rate', 'type': 'score', 'desc': 'Proportion of sessions where AI agent resolved the customer issue'},
-                      {'Name': 'FAITHFULNESS_SCORE', 'label': 'Faithfulness Score', 'type': 'score', 'desc': 'Responses faithful to context (1.0 = no hallucinations)'},
-                      {'Name': 'COMPLETENESS_SCORE', 'label': 'Completeness Score', 'type': 'score', 'desc': 'How complete were AI agent responses'},
-                      {'Name': 'AI_TOOL_SELECTION_ACCURACY', 'label': 'Tool Selection Accuracy', 'type': 'score', 'desc': 'Rate of correct tool selections by AI agents'},
-                      {'Name': 'AI_TOOL_PARAMETER_ACCURACY', 'label': 'Tool Parameter Accuracy', 'type': 'score', 'desc': 'Rate of correct parameters passed to tools'},
-                      {'Name': 'AI_TOOL_UTILIZATION_ACCURACY', 'label': 'Tool Utilization Accuracy', 'type': 'score', 'desc': 'Combined tool selection + parameter accuracy'},
-                      {'Name': 'KNOWLEDGE_CONTENT_REFERENCES', 'label': 'Knowledge Content References', 'type': 'count', 'desc': 'Number of KB articles referenced by AI agents'},
-                      {'Name': 'PROACTIVE_INTENTS_ANSWERED', 'label': 'Proactive Intents Answered', 'type': 'count', 'desc': 'Proactive intents successfully answered'},
-                  ]
-
-                  results = {}
-                  has_data = False
-                  for metric_def in AI_METRICS:
-                      try:
-                          resp = regional_client.get_metric_data_v2(
-                              ResourceArn=instance_arn,
-                              StartTime=start_time,
-                              EndTime=end_time,
-                              Interval={'TimeZone': 'UTC', 'IntervalPeriod': 'TOTAL'},
-                              Filters=[],
-                              Groupings=[],
-                              Metrics=[{'Name': metric_def['Name']}]
-                          )
-                          for mr in resp.get('MetricResults', []):
-                              for col in mr.get('Collections', []):
-                                  val = col.get('Value', None)
-                                  if val is not None:
-                                      results[metric_def['Name']] = val
-                                      has_data = True
-                      except Exception as metric_err:
-                          logger.debug(f"[AI-PERF] Could not fetch {metric_def['Name']}: {metric_err}")
-
-                  if not has_data:
-                      html += f"<p>No AI agent performance data available for the last {days_back} days. AI agents may not have been used, or metrics are still being computed (updated every 24 hours).</p>"
-                      return html
-
-                  html += f"<p>AI Agent performance scorecard for the last {days_back} days. Scores are 0-1 (1.0 = perfect). Updated every 24 hours.</p>"
-
-                  score_metrics = [m for m in AI_METRICS if m['type'] == 'score']
-                  html += """<table style="width: 80%"><tr><th>Metric</th><th style="text-align:center;">Score</th><th>Status</th><th>Description</th></tr>"""
-                  for m in score_metrics:
-                      val = results.get(m['Name'])
-                      if val is not None:
-                          pct = val * 100
-                          if pct >= 80:
-                              color = '#00FF00'
-                              status = 'Good'
-                          elif pct >= 60:
-                              color = '#FFA500'
-                              status = 'Needs Improvement'
-                          else:
-                              color = '#FF0000'
-                              status = 'Poor'
-                          html += f'<tr><td><strong>{escape(m["label"])}</strong></td><td style="text-align:center; font-weight:bold;">{pct:.1f}%</td><td style="background-color: {color};">{status}</td><td>{escape(m["desc"])}</td></tr>'
-                      else:
-                          html += f'<tr><td><strong>{escape(m["label"])}</strong></td><td style="text-align:center;">-</td><td>No data</td><td>{escape(m["desc"])}</td></tr>'
-                  html += "</table>"
-
-                  count_metrics = [m for m in AI_METRICS if m['type'] == 'count']
-                  if any(results.get(m['Name']) is not None for m in count_metrics):
-                      html += "<br><b>Activity Metrics</b><br>"
-                      html += """<table style="width: 60%"><tr><th>Metric</th><th style="text-align:center;">Count</th><th>Description</th></tr>"""
-                      for m in count_metrics:
-                          val = results.get(m['Name'])
-                          display = f"{int(val):,}" if val is not None else '-'
-                          html += f'<tr><td><strong>{escape(m["label"])}</strong></td><td style="text-align:center;">{display}</td><td>{escape(m["desc"])}</td></tr>'
-                      html += "</table>"
-
-                  recs = []
-                  goal_rate = results.get('GOAL_SUCCESS_RATE')
-                  faith_score = results.get('FAITHFULNESS_SCORE')
-                  tool_sel = results.get('AI_TOOL_SELECTION_ACCURACY')
-                  kb_refs = results.get('KNOWLEDGE_CONTENT_REFERENCES')
-                  if goal_rate is not None and goal_rate < 0.6:
-                      recs.append("Goal Success Rate is below 60%. Review AI agent prompts, knowledge base content, and tool configurations.")
-                  if faith_score is not None and faith_score < 0.8:
-                      recs.append("Faithfulness Score is below 80%, indicating potential hallucinations. Strengthen AI guardrails and contextual grounding.")
-                  if tool_sel is not None and tool_sel < 0.7:
-                      recs.append("Tool Selection Accuracy is below 70%. Consider reducing available tools (see MCP Tool Sprawl check) or improving tool descriptions.")
-                  if kb_refs is not None and kb_refs == 0:
-                      recs.append("No knowledge base content referenced. Verify KB association and content freshness (see KB Sync Health check).")
-                  if recs:
-                      html += "<h4>Recommendations</h4><ul>"
-                      for r in recs:
-                          html += f"<li>{r}</li>"
-                      html += "</ul>"
-
-                  return html
-              except Exception as e:
-                  logger.error(f"AI-PERF Error: {e}")
-                  return html + f"<br>Error retrieving AI agent performance metrics: {escape(str(e))}"
-
           """Main Handler"""
           # ── Recommended Alarms for Amazon Connect ──
           RECOMMENDED_CONNECT_ALARMS = [
@@ -3254,18 +1739,12 @@ Resources:
                   users_limit = ""
                   days_back = 30
                   hasConnectReplica = "no"
-          
+
                   s3_reporting_bucket = os.environ.get('S3_REPORTING_BUCKET')
-                  connect_cloudwatch_log_group = os.environ.get('CONNECT_CW_LOG_GROUP')
-          
+
                   logger.info(f"Execute Automated Amazon Connect Operational Review: {datetime_string}")
                   lambda_exec_start_time = time.time()
-          
-                  # Far back to evaluate logs
-                  days_back = 14
-                  end_time = datetime.utcnow()
-                  start_time = end_time - timedelta(days=days_back)
-          
+
                   # Parse Amazon connect instance info from environment variables
                   instance_arn = os.environ.get('CONNECT_INSTANCE_ARN')
                   parsed = parse_connect_instance_arn(instance_arn)
@@ -3273,29 +1752,6 @@ Resources:
                   aws_region = str(parsed['aws_region'])
                   account_id = str(parsed['account_id'])
                   logger.info (f"Instance Details parsed from env variables: {instance_arn}, AWS Region: {aws_region}, Account ID: {account_id}")
-
-                  # Early AI Agent discovery (needed before pillar sections)
-                  enable_ai_checks = os.environ.get('ENABLE_AI_CHECKS', 'true').lower() == 'true'
-                  assistant_id = os.environ.get('ASSISTANT_ID', '').strip()
-                  if enable_ai_checks:
-                      if not assistant_id:
-                          assistant_id = discover_assistant_id(instance_id)
-                      logger.info(f"[AI-CHECKS] assistant_id={'found: ' + assistant_id if assistant_id else 'not found'}")
-                  else:
-                      assistant_id = None
-                      logger.info("[AI-CHECKS] AI Agent checks disabled")
-
-                  # Helper to determine check status from HTML output
-                  def _ai_status(html_result, warn_keywords=None, fail_keywords=None):
-                      warn_keywords = warn_keywords or ['WARNING', 'color: #FFA500', 'color: red', 'CRITICAL', 'missing', 'Missing', 'No guardrail', 'No CloudWatch', 'No KMS', 'Review']
-                      fail_keywords = fail_keywords or ['CRITICAL', 'color: red']
-                      for kw in fail_keywords:
-                          if kw in html_result:
-                              return 'fail'
-                      for kw in warn_keywords:
-                          if kw in html_result:
-                              return 'warn'
-                      return 'pass'
 
                   #Describe Instance and create the intial html output
                   result = describe_connect_to_html(instance_id)
@@ -3489,7 +1945,7 @@ Resources:
                       kvs_streams = [s for s in streaming_encryption_info if s['stream_type'] == 'Kinesis Video Stream']
                       kvs_encrypted = sum(1 for s in kvs_streams if s['encrypted'] is True)
                       kvs_unencrypted = sum(1 for s in kvs_streams if s['encrypted'] is False)
-                      # KDS/Firehose: encryption is at stream level, not in Connect config - unknown from here
+                      # KDS/Firehose: encryption is at stream level, not in Connect config — unknown from here
                       kds_streams = [s for s in streaming_encryption_info if s['stream_type'] == 'Kinesis Data Stream']
                       firehose_streams = [s for s in streaming_encryption_info if s['stream_type'] == 'Kinesis Firehose']
 
@@ -3540,36 +1996,6 @@ Resources:
                           </ul>"""
                       html_output += """</div>"""
 
-                  # ── AI Security Checks (S1-S4) ──
-                  if assistant_id:
-                      html_output += '<div class="section" id="ai-s1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Guardrails</h3>'
-                      html_output += '<p><em>Verifies AI guardrails are deployed with all critical filter types and checks which AI agents have guardrails associated.</em></p>'
-                      _s1_html = check_q_guardrails(assistant_id)
-                      html_output += _s1_html + '</div>'
-                      _s1_status = 'fail' if 'No published AI guardrails' in _s1_html or 'No guardrail' in _s1_html else _ai_status(_s1_html)
-                      checks.append({"pillar": "Security", "check": "AI Guardrails", "status": _s1_status, "detail": "Guardrail filter coverage and agent association analyzed", "anchor": "ai-s1"})
-
-                      html_output += '<div class="section" id="ai-s2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Q in Connect Domain Encryption</h3>'
-                      html_output += '<p><em>Checks whether a customer-managed KMS key is configured for the Q in Connect domain.</em></p>'
-                      _s2_html = check_q_domain_encryption(assistant_id)
-                      html_output += _s2_html + '</div>'
-                      _s2_status = 'pass' if 'Customer-managed KMS' in _s2_html else 'warn'
-                      checks.append({"pillar": "Security", "check": "Q in Connect Domain Encryption", "status": _s2_status, "detail": "CMK configured" if _s2_status == 'pass' else "Using AWS-owned key", "anchor": "ai-s2"})
-
-                      html_output += '<div class="section" id="ai-s3"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Connect Storage Encryption</h3>'
-                      html_output += '<p><em>Checks KMS encryption for call recordings, chat transcripts, and other Connect storage types.</em></p>'
-                      _s3_html = check_connect_storage_encryption(instance_id)
-                      html_output += _s3_html + '</div>'
-                      checks.append({"pillar": "Security", "check": "Connect Storage Encryption", "status": _ai_status(_s3_html, warn_keywords=['No KMS', 'AWS Managed']), "detail": "Storage KMS encryption checked", "anchor": "ai-s3"})
-
-                      html_output += '<div class="section" id="ai-s4"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>MCP Tool Sprawl Detection</h3>'
-                      html_output += '<p><em>Detects excessive MCP tool permissions on security profiles that increase AI agent inference latency.</em></p>'
-                      _s4_html = check_mcp_tool_sprawl(instance_id)
-                      html_output += _s4_html + '</div>'
-                      _s4_status = 'fail' if 'CRITICAL' in _s4_html else _ai_status(_s4_html)
-                      checks.append({"pillar": "Security", "check": "MCP Tool Sprawl", "status": _s4_status, "detail": "Security profile MCP tool counts analyzed", "anchor": "ai-s4"})
-                      logger.info(f"AI Security checks (S1-S4) completed")
-
                   html_output += """<h2>Resilience</h2>
                       <div class="section">
                           <h3>Multi-AZ Architecture</h3>
@@ -3595,7 +2021,7 @@ Resources:
                   # Get all phone numbers for the instance (single scan for both carrier diversity and phone analysis)
                   phone_numbers, phone_type_counts = get_phone_numbers_with_basic_details(connect_client, instance_id)
                   logger.debug(f"Phone numbers: {phone_numbers}")
-          
+
                   multi_groups = segregate_by_multiple_criteria(phone_numbers, ["phone_number_country_code", "phone_number_carrier"])
                   logger.debug("By country code and carrier:")
                   for group_key, ph_nos in multi_groups.items():
@@ -3693,7 +2119,7 @@ Resources:
                   # Cache cfs_current for reuse in logging section
                   cfs_current = next((cur for lbl, cur, _, _ in instance_resource_data if lbl == "Contact Flows per instance"), 0)
 
-                  # Concurrency limits - data-driven
+                  # Concurrency limits — data-driven
                   CONCURRENCY_QUOTAS = [
                       ("Concurrent active calls per instance",   'L-12AB7C57', 'ConcurrentCalls',          'ConcurrentCallsPercentage',          'VoiceCalls', True),
                       ("Concurrent active chats per instance",   'L-D4BA6F6E', 'ConcurrentActiveChats',    'ConcurrentActiveChatsPercentage',    'Chats',      False),
@@ -3766,16 +2192,6 @@ Resources:
                       checks.append({"pillar": "Capacity Analysis", "check": "Amazon Connect Concurrency Limits", "status": "pass", "detail": f"{len(conc_items)} concurrency metrics within safe limits", "anchor": "cap-concurrency"})
 
                   #HTML Output - Connect Usage Vs Limits
-                  # ── AI Resilience Check (R1) ──
-                  if assistant_id:
-                      html_output += '<div class="section" id="ai-r1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Knowledge Base Sync Health</h3>'
-                      html_output += '<p><em>Checks knowledge base associations and content freshness.</em></p>'
-                      _r1_html = check_kb_sync_health(assistant_id)
-                      html_output += _r1_html + '</div>'
-                      _r1_status = 'warn' if 'Review' in _r1_html and 'to review' in _r1_html else 'pass'
-                      checks.append({"pillar": "Resilience", "check": "Knowledge Base Sync Health", "status": _r1_status, "detail": "Knowledge base freshness checked", "anchor": "ai-r1"})
-                      logger.info("AI Resilience check (R1) completed")
-
                   html_output += f"""
                       <h2>Operational Excellence</h2>"""
 
@@ -3838,12 +2254,9 @@ Resources:
                   else:
                       checks.append({"pillar": "Operational Excellence", "check": "Contact Flow Logging", "status": "warn", "detail": f"{len(flows_without_logging)} flows missing logging", "anchor": "ops-logging"})
                       html_output += f"""
-                             <p>{len(flows_without_logging)} contact flows without an explicit <em>Set logging behavior</em> block.<br>
-                             <em>Note: If instance-level flow logging is enabled, these flows may still generate logs via the instance default.
-                             Adding explicit logging blocks is a best practice to prevent silent log loss if instance settings change.</em></p>
+                             <p>{len(flows_without_logging)} contact flows without logging enabled found.</p>
                               <table style="width: 80%">
                                       <tr><th>Flow Name</th><th>Flow ID</th><th>Flow Type</th><th>Status</th><th>State</th></tr>"""
-
                       for flow in flows_without_logging:
                           html_output += f"""<tr><td>{escape(flow['FlowName'])}</td><td>{escape(flow['FlowId'])}</td><td>{escape(flow['FlowType'])}</td><td>{escape(flow['Status'])}</td><td>{escape(flow['State'])}</td></tr>"""
                       html_output += f"""</table>
@@ -3901,21 +2314,6 @@ Resources:
                       else:
                           checks.append({"pillar": "Operational Excellence", "check": "KVS Retention Period", "status": "pass", "detail": f"All {len(kvs_all)} KVS stream(s) have retention > 0h", "anchor": "ops-kvs-retention"})
                       html_output += """</div>"""
-
-                  # ── AI Operational Excellence Checks (O1, O2) ──
-                  if assistant_id:
-                      html_output += '<div class="section" id="ai-o1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Agent Inventory &amp; Status</h3>'
-                      html_output += '<p><em>Lists all AI agents, their types (self-service/agent-assist), and deployment status.</em></p>'
-                      _o1_html = check_ai_agent_inventory(assistant_id, instance_id)
-                      html_output += _o1_html + '</div>'
-                      checks.append({"pillar": "Operational Excellence", "check": "AI Agent Inventory", "status": _ai_status(_o1_html, warn_keywords=['No AI agents']), "detail": "Agent inventory collected", "anchor": "ai-o1"})
-
-                      html_output += '<div class="section" id="ai-o2"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Prompt Configuration</h3>'
-                      html_output += '<p><em>Reviews AI prompt model selection. Model choice affects response latency and quality, not cost.</em></p>'
-                      _o2_html = check_ai_prompt_configuration(assistant_id)
-                      html_output += _o2_html + '</div>'
-                      checks.append({"pillar": "Operational Excellence", "check": "AI Prompt Configuration", "status": _ai_status(_o2_html, warn_keywords=['Higher latency']), "detail": "Prompt model selection reviewed", "anchor": "ai-o2"})
-                      logger.info("AI Operational Excellence checks (O1, O2) completed")
 
                   # ── Capacity Analysis ──
                   html_output += f"""
@@ -4016,7 +2414,7 @@ Resources:
                           api_rate_count += 1
 
                           if applied and current_val != default_val:
-                              # Modified quota - fetch utilization
+                              # Modified quota — fetch utilization
                               util_display = "-"
                               usage_metric = applied.get('UsageMetric')
                               if usage_metric:
@@ -4043,7 +2441,7 @@ Resources:
                               </tr>""")
                               modified_count += 1
                           else:
-                              # Default quota - no utilization lookup
+                              # Default quota — no utilization lookup
                               default_row_parts.append(f"""<tr>
                                   <th>{escape(str(qname))}</th>
                                   <td style="text-align:center;">{default_val}</td>
@@ -4100,16 +2498,6 @@ Resources:
                   duration = time.time() - lambda_exec_intermediate_time
                   logger.info(f"Account Level API Limits Module execution time: {duration}")
                   lambda_exec_intermediate_time = time.time()
-
-                  # ── AI Capacity Checks (Q1, Q2) ──
-                  if assistant_id:
-                      html_output += '<div class="section" id="ai-q1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>Q in Connect Service Limits</h3>'
-                      html_output += '<p><em>Checks usage against non-adjustable Q in Connect limits.</em></p>'
-                      _q1_html = check_q_hard_limits(assistant_id)
-                      html_output += _q1_html + '</div>'
-                      checks.append({"pillar": "Capacity Analysis", "check": "Q in Connect Limits", "status": _ai_status(_q1_html, warn_keywords=['#FFA500', '#FF0000']), "detail": "Service limits and article counts checked", "anchor": "ai-q1"})
-
-                      logger.info("AI Capacity checks (Q1) completed")
 
                   # ── CloudWatch Alarm Validation  ──
                   html_output += f"""
@@ -4290,20 +2678,9 @@ Resources:
 
                   #Phone Number Analysis (reuse data from carrier diversity scan)
                   logger.debug(f"Phone type counts: {phone_type_counts}")
-          
+
                   metadata = phone_type_counts.get('_metadata', {})
                   total_numbers = metadata.get('total_numbers', 0)
-          
-                  # ── AI Observability Checks (P1, P2, AI-PERF) ──
-                  if assistant_id:
-                      html_output += '<div class="section" id="ai-p1"><h3><span style="background:#232F3E; color:#FF9900; padding:2px 8px; border-radius:4px; font-size:0.7rem; font-weight:700; margin-right:8px; vertical-align:middle;">AI</span>AI Agent Logging &amp; Observability</h3>'
-                      html_output += '<p><em>Checks if CloudWatch event log delivery is configured for the AI assistant.</em></p>'
-                      _p1_html = check_ai_agent_logging(assistant_id, account_id, aws_region)
-                      html_output += _p1_html + '</div>'
-                      _p1_status = 'pass' if 'log delivery configured' in _p1_html else 'warn'
-                      checks.append({"pillar": "Observability", "check": "AI Agent Logging", "status": _p1_status, "detail": "Log delivery configured" if _p1_status == 'pass' else "No Vended Logs delivery found", "anchor": "ai-p1"})
-
-                      logger.info("AI Observability checks (P1) completed")
 
                   html_output += f"""
                       <h2>Cost Considerations</h2>
@@ -4311,7 +2688,7 @@ Resources:
                       <h3>Phone Number Analysis</h3>
                       <p>Analyzed {escape(str(total_numbers))} phone numbers.</p>
                       """
-          
+
                   if total_numbers == 0:
                        html_output += "<p>No phone numbers analyzed.</p>"
 
@@ -4339,7 +2716,7 @@ Resources:
                       # Check for special types
                       uifn_count = phone_type_counts.get('UIFN', 0)
                       short_code_count = phone_type_counts.get('SHORT_CODE', 0)
-          
+
                       if uifn_count > 0:
                           html_output += (f"<p>Global accessibility: {uifn_count} UIFN numbers for international toll-free access</p>")
 
@@ -4348,7 +2725,7 @@ Resources:
 
                       html_output += f"""
                           <h4>Recommendations</h4>"""
-          
+
                       if phone_type_counts.get('TOLL_FREE', 0) == 0:
                           html_output += f"""    
                           {get_recommendation("phone_number_no_tollfree")}
@@ -4410,24 +2787,7 @@ Resources:
                       </html>
                       """
 
-                  # Get key metrics
-                  get_connect_metric_simple(instance_id, 'CallsPerInterval', days_back)
-                  get_connect_metric_simple(instance_id, 'ConcurrentCalls', days_back)
-                  get_connect_metric_simple(instance_id, 'MissedCalls', days_back)
-                  get_connect_metric_simple(instance_id, 'QueueSize', days_back)
-          
-          
-          
-                  # (AI checks already distributed into pillar sections above)
-                  if assistant_id:
-                      logger.info("All AI Agent checks completed (distributed across pillars)")
-                  elif enable_ai_checks:
-                      logger.info("No assistant ID found. AI checks skipped.")
-                  else:
-                      logger.info("AI Agent checks disabled")
-          
-
-                  # ── Generate Executive Summary and inject at top (after ALL checks including AI) ──
+                  # ── Generate Executive Summary and inject at top ──
                   pass_count = sum(1 for c in checks if c["status"] == "pass")
                   fail_count = sum(1 for c in checks if c["status"] == "fail")
                   warn_count = sum(1 for c in checks if c["status"] == "warn")
@@ -4468,9 +2828,15 @@ Resources:
                       <table style="width:100%;">
                           <tr><th>Pillar</th><th>Check</th><th>Status</th><th>Detail</th></tr>"""
 
+                  # Sort checks by pillar order (matching HTML), then by status severity within each pillar
                   pillar_order = ["Security", "Resilience", "Operational Excellence", "Capacity Analysis", "Observability", "Cost"]
                   status_order = {"fail": 0, "warn": 1, "info": 2, "pass": 3}
-                  capacity_check_order = ["Amazon Connect Instance Resource Limits", "Amazon Connect Concurrency Limits", "Amazon Connect API Limits (Account Level)"]
+                  # Fixed order for Capacity Analysis checks
+                  capacity_check_order = [
+                      "Amazon Connect Instance Resource Limits",
+                      "Amazon Connect Concurrency Limits",
+                      "Amazon Connect API Limits (Account Level)",
+                  ]
                   sorted_checks = sorted(checks, key=lambda c: (
                       pillar_order.index(c["pillar"]) if c["pillar"] in pillar_order else 99,
                       capacity_check_order.index(c["check"]) if c["pillar"] == "Capacity Analysis" and c["check"] in capacity_check_order else status_order.get(c["status"], 99)
@@ -4480,9 +2846,11 @@ Resources:
                   for c in sorted_checks:
                       st = c["status"]
                       anchor = c.get("anchor", "")
+                      # Add pillar separator row when pillar changes
                       if c["pillar"] != current_pillar:
                           current_pillar = c["pillar"]
                           pillar_checks = [x for x in sorted_checks if x["pillar"] == current_pillar]
+                          pillar_pass = sum(1 for x in pillar_checks if x["status"] == "pass")
                           pillar_fail = sum(1 for x in pillar_checks if x["status"] == "fail")
                           pillar_warn = sum(1 for x in pillar_checks if x["status"] == "warn")
                           pillar_badge = ""
@@ -4490,27 +2858,21 @@ Resources:
                               pillar_badge = f'<span style="background:#ef4444; color:#fff; padding:2px 8px; border-radius:999px; font-size:0.75em; margin-left:8px;">{pillar_fail} fail</span>'
                           if pillar_warn > 0:
                               pillar_badge += f'<span style="background:#f59e0b; color:#fff; padding:2px 8px; border-radius:999px; font-size:0.75em; margin-left:4px;">{pillar_warn} warn</span>'
-                          summary_html += f"""<tr style="background-color:#f1f5f9;"><td colspan="4" style="font-weight:700; font-size:0.9rem; padding:10px 14px; color:#334155;">{escape(current_pillar)} ({len(pillar_checks)} checks) {pillar_badge}</td></tr>"""
-                      ai_badge = '<span style="background:#232F3E; color:#FF9900; padding:1px 6px; border-radius:3px; font-size:0.65rem; font-weight:700; margin-right:6px; vertical-align:middle;">AI</span>' if anchor.startswith('ai-') else ''
-                      check_link = f'<a href="#{anchor}" style="color:{STATUS_CONFIG[st]["color"]}; text-decoration:none; border-bottom:1px dashed {STATUS_CONFIG[st]["border"]}; font-weight:600;">{ai_badge}{escape(c["check"])}</a>' if anchor else f'<span style="font-weight:600;">{escape(c["check"])}</span>'
-                      summary_html += f"""<tr style="background-color:{STATUS_CONFIG[st]["bg"]}; border-left:4px solid {STATUS_CONFIG[st]["border"]};"><td style="font-weight:700; font-size:0.85rem;">{escape(c["pillar"])}</td><td style="font-size:0.85rem;">{check_link}</td><td style="font-size:0.85rem;">{STATUS_CONFIG[st]["icon"]} <span style="color:{STATUS_CONFIG[st]["color"]}; font-weight:700;">{STATUS_CONFIG[st]["label"]}</span></td><td style="font-size:0.85rem;">{escape(c["detail"])}</td></tr>"""
+                          summary_html += f"""<tr style="background-color:#f1f5f9;">
+                              <td colspan="4" style="font-weight:700; font-size:0.9rem; padding:10px 14px; color:#334155;">{escape(current_pillar)} ({len(pillar_checks)} checks) {pillar_badge}</td>
+                          </tr>"""
+                      check_link = f'<a href="#{anchor}" style="color:{STATUS_CONFIG[st]["color"]}; text-decoration:none; border-bottom:1px dashed {STATUS_CONFIG[st]["border"]}; font-weight:600;">{escape(c["check"])}</a>' if anchor else f'<span style="font-weight:600;">{escape(c["check"])}</span>'
+                      summary_html += f"""<tr style="background-color:{STATUS_CONFIG[st]["bg"]}; border-left:4px solid {STATUS_CONFIG[st]["border"]};">
+                          <td style="font-weight:700; font-size:0.85rem;">{escape(c["pillar"])}</td>
+                          <td style="font-size:0.85rem;">{check_link}</td>
+                          <td style="font-size:0.85rem;">{STATUS_CONFIG[st]["icon"]} <span style="color:{STATUS_CONFIG[st]["color"]}; font-weight:700;">{STATUS_CONFIG[st]["label"]}</span></td>
+                          <td style="font-size:0.85rem;">{escape(c["detail"])}</td>
+                      </tr>"""
 
                   summary_html += """</table></div>"""
-                  html_output = html_output.replace(SUMMARY_PLACEHOLDER, summary_html)
 
-                  # Post-process: make each section collapsible
-                  import re as _re
-                  def _make_collapsible(match):
-                      attrs = match.group(1) or ''
-                      h3_content = match.group(2)
-                      rest = match.group(3)
-                      return f'<div class="section"{attrs}><div class="section-header" onclick="toggleSection(this)"><span class="toggle-arrow">&#9660;</span><h3 style="margin:0;">{h3_content}</h3></div><div class="section-body">{rest}</div></div>'
-                  html_output = _re.sub(
-                      r'<div class="section"([^>]*)>\s*<h3[^>]*>(.*?)</h3>(.*?)</div>\s*(?=<div class="section"|<h2|</div>\s*</body>|$)',
-                      _make_collapsible,
-                      html_output,
-                      flags=_re.DOTALL
-                  )
+                  # Replace placeholder with actual summary
+                  html_output = html_output.replace(SUMMARY_PLACEHOLDER, summary_html)
 
                   # Get Date timestamp
                   now_utc = datetime.now(timezone.utc)
@@ -4527,12 +2889,12 @@ Resources:
                   lambda_exec_end_time = time.time()
                   duration = lambda_exec_end_time - lambda_exec_start_time
                   print(f"Lambda execution time: {duration}")
-          
+
                   return {
                           'statusCode': 200,
                           'body': json.dumps({'success': f'Amazon Connect Ops Review document succesfully generated. Execution duration: {duration} seconds")'})
                       }
-          
+
               except Exception as e:
                   exc_type, exc_obj, exc_tb = sys.exc_info()
                   lineno = exc_tb.tb_lineno
@@ -4548,8 +2910,7 @@ Resources:
                           'message': str(traceback.print_exc())
                       })
                   }
-          
-          
+
   # CloudWatch Log Group for Lambda
   LambdaLogGroup:
     Type: AWS::Logs::LogGroup
